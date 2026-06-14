@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "ultracodex",
+  "description": "A single-plugin marketplace that blends Codex headless into Claude Code Workflow (ultracode) orchestration.",
+  "owner": {
+    "name": "KingGyuSuh",
+    "email": "tjdhkdrb@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "ultracodex",
+      "displayName": "Ultracodex",
+      "source": "./plugins/ultracodex",
+      "description": "Blend Codex headless (codex exec) nodes into Claude Code Workflow (ultracode) orchestration for cross-model adversarial verification, judge panels with a Codex juror, and second-opinion generation.",
+      "author": {
+        "name": "KingGyuSuh",
+        "email": "tjdhkdrb@gmail.com",
+        "url": "https://github.com/KingGyuSuh"
+      },
+      "homepage": "https://github.com/KingGyuSuh/ultracodex",
+      "repository": "https://github.com/KingGyuSuh/ultracodex",
+      "license": "Apache-2.0",
+      "category": "workflow",
+      "tags": [
+        "codex",
+        "cross-model",
+        "verification",
+        "workflow",
+        "llm-judge",
+        "second-opinion"
+      ]
+    }
+  ]
+}

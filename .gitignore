@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs and scratch
+*.log
+tmp/
+.tmp/
+
+# Local Claude Code state (do not publish machine-local settings)
+.claude/settings.json
+.claude/settings.local.json
+.claude/*.local.json
+.claude/*.local.md
+
+# Node (only if tooling is added later)
+node_modules/
