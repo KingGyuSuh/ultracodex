@@ -110,7 +110,8 @@ codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidat
   (20 min), and `ultra` nodes default to 1800000 (30 min); non-finite or
   non-positive values fall back to the default. The helper always launches
   codex as a **background** Bash call with an in-snippet watchdog (TERM to
-  codex and its children at the deadline, KILL 10 s later, plus an exit trap)
+  codex and its children at the deadline, KILL 10 s later, plus an exit trap
+  that repeats the escalation if the Bash task is cancelled mid-run)
   — the foreground Bash cap is 10 min (default 2 min, which kills anything
   beyond a routine verify and fabricates `_codex_error`), while measured
   real-task runs reach ~8–17 min at high efforts.

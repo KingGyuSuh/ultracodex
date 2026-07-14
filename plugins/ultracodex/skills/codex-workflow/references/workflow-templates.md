@@ -48,9 +48,12 @@ object.
 //             launched as a BACKGROUND Bash call — the Bash tool's foreground cap is
 //             10 min (default 2), and a timeout kill fabricates {"_codex_error":true}.
 //             The in-snippet watchdog TERMs codex and its children at the deadline and
-//             KILLs whatever survives 10 s later; an EXIT/INT/TERM trap reaps both if
-//             the Bash task itself is cancelled. (POSIX sleep+kill/pkill because macOS
-//             ships neither GNU `timeout` nor `setsid`.)
+//             KILLs whatever survives 10 s later; if the Bash task itself is cancelled,
+//             an EXIT/INT/TERM trap runs the same children+TERM→KILL escalation (2 s
+//             grace — best-effort, the wrapper is being torn down) when codex is still
+//             alive, then reaps the watchdog. The kill -0 guard keeps the normal exit
+//             path delay-free. (POSIX sleep+kill/pkill because macOS ships neither
+//             GNU `timeout` nor `setsid`.)
 function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label, timeoutMs } = {}) {
   const flags = [
     model  ? `-m ${model}` : '',
@@ -92,11 +95,19 @@ CODEX_TASK_EOF
     --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1 &
   CODEX_PID=$!
   ( sleep ${deadlineSec}
-    pkill -P "$CODEX_PID" 2>/dev/null; kill "$CODEX_PID" 2>/dev/null
+    kill "$CODEX_PID" 2>/dev/null; pkill -P "$CODEX_PID" 2>/dev/null
     sleep 10
     pkill -9 -P "$CODEX_PID" 2>/dev/null; kill -9 "$CODEX_PID" 2>/dev/null ) >/dev/null 2>&1 &
   WATCHDOG_PID=$!
-  trap 'kill "$CODEX_PID" "$WATCHDOG_PID" 2>/dev/null' EXIT INT TERM
+  cleanup() {
+    if kill -0 "$CODEX_PID" 2>/dev/null; then
+      kill "$CODEX_PID" 2>/dev/null; pkill -P "$CODEX_PID" 2>/dev/null
+      sleep 2
+      pkill -9 -P "$CODEX_PID" 2>/dev/null; kill -9 "$CODEX_PID" 2>/dev/null
+    fi
+    kill "$WATCHDOG_PID" 2>/dev/null
+  }
+  trap cleanup EXIT INT TERM
   wait "$CODEX_PID"
   cat "$OUT"
 
