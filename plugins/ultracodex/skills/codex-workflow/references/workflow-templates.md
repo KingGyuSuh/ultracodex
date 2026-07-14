@@ -34,20 +34,53 @@ object.
 //             (low→xhigh; GPT-5.6 tiers also take "max", and "ultra" on sol/terra).
 // model:      optional -m override; use fully-qualified tier IDs (gpt-5.6-sol/-terra/-luna).
 // revalidate: default true; set false for large payloads and JSON.parse the string yourself.
-function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label } = {}) {
+//             Re-validation wraps the result in a { result: anyOf[schema, sentinel] }
+//             envelope (unwrapped before return) so a legitimate {"_codex_error":true}
+//             (e.g. after a watchdog kill) survives strict validation — keep filtering
+//             the sentinel out downstream as always. The envelope exists because
+//             Anthropic's tool input_schema rejects anyOf/oneOf/allOf at the TOP level
+//             (400 before any agent runs); nested one level down it is legal.
+// timeoutMs:  watchdog deadline for the codex run. Default 1200000 (20 min); "ultra"
+//             nodes default to 1800000 (30 min); non-finite or non-positive values fall
+//             back to the default. Runtime scales steeply with tier × effort (measured
+//             on real tasks, codex 0.144.0: sol@max ~8 min, sol@xhigh ~14 min, sol@ultra
+//             ~17 min — the defaults budget headroom, not the mean). The run is ALWAYS
+//             launched as a BACKGROUND Bash call — the Bash tool's foreground cap is
+//             10 min (default 2), and a timeout kill fabricates {"_codex_error":true}.
+//             The in-snippet watchdog TERMs codex and its children at the deadline and
+//             KILLs whatever survives 10 s later; an EXIT/INT/TERM trap reaps both if
+//             the Bash task itself is cancelled. (POSIX sleep+kill/pkill because macOS
+//             ships neither GNU `timeout` nor `setsid`.)
+function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label, timeoutMs } = {}) {
   const flags = [
     model  ? `-m ${model}` : '',
     cwd    ? `-C "${cwd}"` : '',   // quote: cwd is an arbitrary path and may contain spaces
     effort ? `-c model_reasoning_effort="${effort}"` : '',
   ].filter(Boolean).join(' ')
   const schemaJson = JSON.stringify(schema, null, 2)
+  const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : (effort === 'ultra' ? 1800000 : 1200000)
+  const deadlineSec = Math.ceil(deadlineMs / 1000)
+  const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean' } } }
+  const relaySchema = revalidate
+    ? { type: 'object', additionalProperties: false, required: ['result'],
+        properties: { result: { anyOf: [schema, sentinel] } } }
+    : undefined
   return agent(
     `You are a RELAY, not a solver. Do NOT attempt the task yourself, do NOT
 reason about it, do NOT use your own judgment. Your only job is to run Codex on
 the task below and return Codex's JSON verbatim. If you answer it yourself the
 whole point — a second, independent model — is defeated.
 
-Run exactly this (the heredocs write the schema and task to temp files):
+Codex runs for many minutes at higher reasoning efforts (real-task runs measured
+~8–17 min — past the 10-minute foreground Bash cap, let alone the 2-minute
+default, and a timeout kill fabricates a fake error). So launch the snippet
+below as ONE Bash call with run_in_background: true — NEVER as a foreground
+call — then wait for the background task to exit (you are re-invoked when it
+does). The watchdog inside the snippet kills codex after ${deadlineSec}s if it
+runs away (TERM, then KILL 10 s later). The snippet prints nothing except the
+final cat, so the task's collected output IS the JSON — retrieve it and return it.
+
+The snippet (the heredocs write the schema and task to temp files):
   SCHEMA=$(mktemp); TASK=$(mktemp); OUT=$(mktemp)
   cat > "$SCHEMA" <<'CODEX_SCHEMA_EOF'
 ${schemaJson}
@@ -56,13 +89,23 @@ CODEX_SCHEMA_EOF
 ${taskText}
 CODEX_TASK_EOF
   codex exec --skip-git-repo-check -s ${sandbox} ${flags} \\
-    --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1
+    --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1 &
+  CODEX_PID=$!
+  ( sleep ${deadlineSec}
+    pkill -P "$CODEX_PID" 2>/dev/null; kill "$CODEX_PID" 2>/dev/null
+    sleep 10
+    pkill -9 -P "$CODEX_PID" 2>/dev/null; kill -9 "$CODEX_PID" 2>/dev/null ) >/dev/null 2>&1 &
+  WATCHDOG_PID=$!
+  trap 'kill "$CODEX_PID" "$WATCHDOG_PID" 2>/dev/null' EXIT INT TERM
+  wait "$CODEX_PID"
   cat "$OUT"
 
 Return EXACTLY the contents of "$OUT" — no prose, no markdown fences. If "$OUT"
-is empty or codex errored, return the literal: {"_codex_error": true}`,
-    { label: label ?? 'codex', phase, schema: revalidate ? schema : undefined },
-  )
+is empty or codex errored, return the literal: {"_codex_error": true}
+If you are given a structured-output tool whose schema has a "result" field,
+pass that JSON (or the error literal) as the value of "result".`,
+    { label: label ?? 'codex', phase, schema: relaySchema },
+  ).then(r => (r && typeof r === 'object' && r.result !== undefined) ? r.result : r)
 }
 ```
 
@@ -339,6 +382,12 @@ Full failure-mode table in `codex-headless.md` → Troubleshooting.
 
 - **Keep Codex nodes short** (read-only verify/judge/small-gen). They hold a
   concurrency slot for Codex's full runtime — do not put long implementations here.
+- **Give codex real time.** The helper launches every codex run as a background
+  Bash call with a sleep+kill watchdog: `timeoutMs` defaults to 20 min, and
+  `ultra` nodes get 30 (measured real-task runs: sol@`max` ~8 min, sol@`xhigh`
+  ~14 min, sol@`ultra` ~17 min — the defaults budget headroom, not the mean).
+  A foreground Bash call — 10-minute cap, 2-minute default — would kill
+  high-effort runs mid-flight and fabricate `{"_codex_error":true}`.
 - **Schemas must be strict** — set `additionalProperties: false` **and** list
   *every* key from `properties` in `required` (OpenAI's structured-output backend
   400s on a partial `required` *before the run starts* — strict mode has no
