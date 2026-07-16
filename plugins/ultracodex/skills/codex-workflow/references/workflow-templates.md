@@ -51,6 +51,10 @@ object.
 //             ("#", "#/…") are rebased; named-anchor refs ("#name", paired with
 //             $anchor) are left intact — anchors resolve by name within the schema
 //             resource, so they survive relocation and rewriting would corrupt them.
+//             And only in SCHEMA positions: values under const/enum/default/examples
+//             are data (a "$ref" there is a literal, not a reference), and property
+//             maps (properties/$defs/…) are walked as name→schema maps so a property
+//             literally named "$ref" or "const" is not misread as a keyword.
 //             Codex itself still gets the ORIGINAL schema file (there the schema IS
 //             the root). Rebasing stops at any subschema carrying a string $id —
 //             root or nested (e.g. under $defs): it forms its own schema resource,
@@ -97,13 +101,20 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
   const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : (effort === 'ultra' ? 1800000 : 1200000)
   const deadlineSec = Math.ceil(deadlineMs / 1000)
   const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean', enum: [true] } } }
-  const rebaseRefs = node => Array.isArray(node) ? node.map(rebaseRefs)
-    : node && typeof node === 'object'
-      ? typeof node.$id === 'string' ? node   // own schema resource — its "#…" refs resolve against that $id
-        : Object.fromEntries(Object.entries(node).map(([k, v]) =>
-            [k, k === '$ref' && typeof v === 'string' && (v === '#' || v.startsWith('#/'))
-              ? `#/properties/result/anyOf/0${v.slice(1)}` : rebaseRefs(v)]))
-      : node
+  const DATA_KEYS = ['const', 'enum', 'default', 'examples']   // keyword values that hold DATA, not schemas
+  const MAP_KEYS = ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']
+  const rebaseRefs = (node, isMap) => {
+    if (Array.isArray(node)) return node.map(v => rebaseRefs(v))
+    if (!node || typeof node !== 'object') return node
+    if (!isMap && typeof node.$id === 'string') return node    // own schema resource — its "#…" refs resolve against that $id
+    return Object.fromEntries(Object.entries(node).map(([k, v]) => {
+      if (isMap) return [k, rebaseRefs(v)]                     // map keys are property NAMES; values are schemas
+      if (DATA_KEYS.includes(k)) return [k, v]                 // a "$ref" inside const/enum is data, not a reference
+      if (k === '$ref' && typeof v === 'string' && (v === '#' || v.startsWith('#/')))
+        return [k, `#/properties/result/anyOf/0${v.slice(1)}`]
+      return [k, rebaseRefs(v, MAP_KEYS.includes(k))]
+    }))
+  }
   const relaySchema = revalidate
     ? { type: 'object', additionalProperties: false, required: ['result'],
         properties: { result: { anyOf: [rebaseRefs(schema), sentinel] } } }
