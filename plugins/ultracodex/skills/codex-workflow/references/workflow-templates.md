@@ -75,7 +75,11 @@ object.
 //             on TERM its children reparent and any single-level pkill -P would never
 //             reach them. The parent's death also unblocks the wrapper's wait, whose
 //             EXIT trap reaps the watchdog mid-grace — so the trap ends by sweeping
-//             the captured list itself. Every DELAYED -9 goes through sweep9(), which
+//             the captured list itself. Before each final sweep, regrow() re-expands
+//             the capture from still-alive captured PIDs — not just the (possibly
+//             dead) codex root — so work a TERM-resistant survivor forked during the
+//             grace window is swept too (best-effort: a tree that keeps forking can
+//             always race a POSIX sweep). Every DELAYED -9 goes through sweep9(), which
 //             re-checks each captured PID's parentage first (reparented orphan —
 //             ppid 1 — or still inside the captured tree): a PID recycled during the
 //             grace window is not blindly SIGKILLed. Residual caveat: under a
@@ -163,11 +167,16 @@ CODEX_TASK_EOF
       fi
     done < "$KIDSFILE"
   }
+  regrow() {
+    SURV=$(while read -r P; do kill -0 "$P" 2>/dev/null && printf '%s ' "$P"; done < "$KIDSFILE")
+    [ -n "$SURV" ] && kids "$SURV" >> "$KIDSFILE"
+  }
   ( sleep ${deadlineSec}
     kids "$CODEX_PID" > "$KIDSFILE"
     kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
     sleep 10
     kids "$CODEX_PID" >> "$KIDSFILE"
+    regrow
     kill -9 "$CODEX_PID" 2>/dev/null; sweep9 ) >/dev/null 2>&1 &
   WATCHDOG_PID=$!
   cleanup() {
@@ -178,7 +187,7 @@ CODEX_TASK_EOF
       kill -9 "$CODEX_PID" 2>/dev/null
     fi
     kill "$WATCHDOG_PID" $(pgrep -P "$WATCHDOG_PID") 2>/dev/null
-    [ -s "$KIDSFILE" ] && sweep9
+    if [ -s "$KIDSFILE" ]; then regrow; sweep9; fi
   }
   trap cleanup EXIT
   trap 'exit 130' INT
