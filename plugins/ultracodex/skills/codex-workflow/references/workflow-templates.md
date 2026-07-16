@@ -39,11 +39,15 @@ object.
 //             (e.g. after a watchdog kill) survives strict validation — keep filtering
 //             the sentinel out downstream as always. The envelope exists because
 //             Anthropic's tool input_schema rejects anyOf/oneOf/allOf at the TOP level
-//             (400 before any agent runs); nested one level down it is legal. The
-//             schema's root $defs/definitions are hoisted onto the envelope: root-
-//             relative $refs ("#/$defs/…") resolve from the document root, which the
-//             wrapping moves — without the hoist they'd point to nowhere and every
-//             valid Codex payload would fail re-validation.
+//             (400 before any agent runs); nested one level down it is legal. Root-
+//             relative $refs inside the schema ("#", "#/$defs/…", "#/properties/…")
+//             are rebased onto the embedded location ("#/properties/result/anyOf/0…"):
+//             wrapping moves the document root, so unrebased they'd resolve against
+//             the envelope — broken refs for $defs, and for recursive self-refs a
+//             validator that rejects every valid payload. Codex itself still gets the
+//             ORIGINAL schema file (there the schema IS the root). A schema carrying
+//             its own $id is embedded untouched — it forms its own schema resource
+//             and rebasing would corrupt it.
 // timeoutMs:  watchdog deadline for the codex run. Default 1200000 (20 min); "ultra"
 //             nodes default to 1800000 (30 min); non-finite or non-positive values fall
 //             back to the default. Runtime scales steeply with tier × effort (measured
@@ -76,11 +80,15 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
   const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : (effort === 'ultra' ? 1800000 : 1200000)
   const deadlineSec = Math.ceil(deadlineMs / 1000)
   const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean' } } }
+  const rebaseRefs = node => Array.isArray(node) ? node.map(rebaseRefs)
+    : node && typeof node === 'object'
+      ? Object.fromEntries(Object.entries(node).map(([k, v]) =>
+          [k, k === '$ref' && typeof v === 'string' && v.startsWith('#')
+            ? `#/properties/result/anyOf/0${v.slice(1)}` : rebaseRefs(v)]))
+      : node
   const relaySchema = revalidate
     ? { type: 'object', additionalProperties: false, required: ['result'],
-        ...(schema.$defs ? { $defs: schema.$defs } : {}),
-        ...(schema.definitions ? { definitions: schema.definitions } : {}),
-        properties: { result: { anyOf: [schema, sentinel] } } }
+        properties: { result: { anyOf: [schema.$id ? schema : rebaseRefs(schema), sentinel] } } }
     : undefined
   return agent(
     `You are a RELAY, not a solver. Do NOT attempt the task yourself, do NOT
