@@ -400,13 +400,19 @@ for (let round = 0; round < MAX_ROUNDS; round++) {
   // failure (auth expiry, bad schema, watchdog kill) — surface it, never exit as "dry".
   if (fresh.length > 0 && usable.length === 0)
     throw new Error(`round ${roundsUsed}: every Codex verdict errored — re-run the preflight`)
-  if (usable.length < fresh.length)
-    log(`round ${roundsUsed}: ${fresh.length - usable.length}/${fresh.length} verdicts errored or lost`)
+  // partially errored/lost verdicts: un-see those findings so a later round can
+  // re-surface them — a transient failure must not permanently drop an unverified finding.
+  const usableIds = new Set(usable.map(f => f.id))
+  const unjudged = fresh.filter(f => !usableIds.has(f.id))
+  unjudged.forEach(f => seen.delete(f.id))
+  if (unjudged.length)
+    log(`round ${roundsUsed}: ${unjudged.length}/${fresh.length} verdicts errored or lost — returned to the pool`)
   const newlyConfirmed = usable.filter(f => f.verdict.refuted === false)
   confirmed.push(...newlyConfirmed)
-  // the gate is CONFIRMED survivors, not raw Claude output: a round Codex refutes
-  // wholesale is dry, and a round with no fresh findings is trivially dry too.
-  if (newlyConfirmed.length === 0) break
+  // the gate is CONFIRMED survivors, not raw Claude output — and only a FULLY-judged
+  // round may declare dry: every fresh finding has a usable verdict and none was
+  // confirmed. (A round with no fresh findings is trivially dry.)
+  if (newlyConfirmed.length === 0 && unjudged.length === 0) break
 }
 return { confirmed, rounds_used: roundsUsed }
 ```
