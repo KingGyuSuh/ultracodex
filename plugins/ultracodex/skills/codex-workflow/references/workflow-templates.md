@@ -44,10 +44,13 @@ object.
 //             are rebased onto the embedded location ("#/properties/result/anyOf/0…"):
 //             wrapping moves the document root, so unrebased they'd resolve against
 //             the envelope — broken refs for $defs, and for recursive self-refs a
-//             validator that rejects every valid payload. Codex itself still gets the
-//             ORIGINAL schema file (there the schema IS the root). A schema carrying
-//             its own $id is embedded untouched — it forms its own schema resource
-//             and rebasing would corrupt it.
+//             validator that rejects every valid payload. Only JSON-pointer fragments
+//             ("#", "#/…") are rebased; named-anchor refs ("#name", paired with
+//             $anchor) are left intact — anchors resolve by name within the schema
+//             resource, so they survive relocation and rewriting would corrupt them.
+//             Codex itself still gets the ORIGINAL schema file (there the schema IS
+//             the root). A schema carrying its own $id is embedded untouched — it
+//             forms its own schema resource and rebasing would corrupt it.
 // timeoutMs:  watchdog deadline for the codex run. Default 1200000 (20 min); "ultra"
 //             nodes default to 1800000 (30 min); non-finite or non-positive values fall
 //             back to the default. Runtime scales steeply with tier × effort (measured
@@ -64,12 +67,14 @@ object.
 //             The trap therefore ends by KILL-sweeping the captured PIDs itself. It
 //             also reaps the watchdog together with its blocked `sleep` child, pre-
 //             captured in the same kill — TERMing the subshell alone would reparent
-//             the sleep and leave a deadline-length orphan per successful node. If
-//             the Bash task is cancelled while codex is alive, the same trap first
-//             runs the capture+TERM→KILL escalation (2 s grace — best-effort, the
-//             wrapper is being torn down). The kill -0 guard keeps the normal exit
-//             path delay-free. (POSIX sleep+kill/pkill/pgrep because macOS ships
-//             neither GNU `timeout` nor `setsid`.)
+//             the sleep and leave a deadline-length orphan per successful node.
+//             Cancellation (INT/TERM) exits 130/143 through the EXIT trap: cleanup
+//             still runs exactly once (capture+TERM→KILL escalation when codex is
+//             alive, 2 s grace — best-effort, the wrapper is being torn down), but
+//             the interrupted wait no longer falls through to the final cat, which
+//             would disguise a cancelled node as a normal empty result. The kill -0
+//             guard keeps the normal exit path delay-free. (POSIX sleep+kill/pkill/
+//             pgrep because macOS ships neither GNU `timeout` nor `setsid`.)
 function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label, timeoutMs } = {}) {
   const flags = [
     model  ? `-m ${model}` : '',
@@ -83,7 +88,7 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
   const rebaseRefs = node => Array.isArray(node) ? node.map(rebaseRefs)
     : node && typeof node === 'object'
       ? Object.fromEntries(Object.entries(node).map(([k, v]) =>
-          [k, k === '$ref' && typeof v === 'string' && v.startsWith('#')
+          [k, k === '$ref' && typeof v === 'string' && (v === '#' || v.startsWith('#/'))
             ? `#/properties/result/anyOf/0${v.slice(1)}` : rebaseRefs(v)]))
       : node
   const relaySchema = revalidate
@@ -133,7 +138,9 @@ CODEX_TASK_EOF
     kill "$WATCHDOG_PID" $(pgrep -P "$WATCHDOG_PID") 2>/dev/null
     [ -s "$KIDSFILE" ] && kill -9 $(cat "$KIDSFILE") 2>/dev/null
   }
-  trap cleanup EXIT INT TERM
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   wait "$CODEX_PID"
   cat "$OUT"
 
