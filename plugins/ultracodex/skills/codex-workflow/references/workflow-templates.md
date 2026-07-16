@@ -102,7 +102,8 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
   const deadlineSec = Math.ceil(deadlineMs / 1000)
   const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean', enum: [true] } } }
   const DATA_KEYS = ['const', 'enum', 'default', 'examples']   // keyword values that hold DATA, not schemas
-  const MAP_KEYS = ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']
+  const MAP_KEYS = ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas',
+    'dependencies']   // draft-07 dependencies: name→schema map too (its array-of-names form passes through as strings)
   const rebaseRefs = (node, isMap) => {
     if (Array.isArray(node)) return node.map(v => rebaseRefs(v))
     if (!node || typeof node !== 'object') return node
@@ -394,8 +395,14 @@ for (let round = 0; round < MAX_ROUNDS; round++) {
   const verdicts = fresh.length ? await parallel(fresh.map(f => () =>
     codexNode(`Adversarially verify, defaulting to refuted=true if uncertain:\n${f.title}\n${f.detail}`,
       { schema: VERDICT, label: `codex:${f.id}` }).then(v => ({ ...f, verdict: v })))) : []
-  const newlyConfirmed = verdicts.filter(Boolean)
-    .filter(f => f.verdict && !f.verdict._codex_error && f.verdict.refuted === false)
+  const usable = verdicts.filter(Boolean).filter(f => f.verdict && !f.verdict._codex_error)
+  // an errored verdict is NO verdict: a round whose verdicts ALL errored is an infra
+  // failure (auth expiry, bad schema, watchdog kill) — surface it, never exit as "dry".
+  if (fresh.length > 0 && usable.length === 0)
+    throw new Error(`round ${roundsUsed}: every Codex verdict errored — re-run the preflight`)
+  if (usable.length < fresh.length)
+    log(`round ${roundsUsed}: ${fresh.length - usable.length}/${fresh.length} verdicts errored or lost`)
+  const newlyConfirmed = usable.filter(f => f.verdict.refuted === false)
   confirmed.push(...newlyConfirmed)
   // the gate is CONFIRMED survivors, not raw Claude output: a round Codex refutes
   // wholesale is dry, and a round with no fresh findings is trivially dry too.
