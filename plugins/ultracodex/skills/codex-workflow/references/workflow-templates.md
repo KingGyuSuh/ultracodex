@@ -49,8 +49,10 @@ object.
 //             $anchor) are left intact — anchors resolve by name within the schema
 //             resource, so they survive relocation and rewriting would corrupt them.
 //             Codex itself still gets the ORIGINAL schema file (there the schema IS
-//             the root). A schema carrying its own $id is embedded untouched — it
-//             forms its own schema resource and rebasing would corrupt it.
+//             the root). Rebasing stops at any subschema carrying a string $id —
+//             root or nested (e.g. under $defs): it forms its own schema resource,
+//             its "#…" refs already resolve against that $id wherever it sits, and
+//             rewriting them would corrupt it.
 // timeoutMs:  watchdog deadline for the codex run. Default 1200000 (20 min); "ultra"
 //             nodes default to 1800000 (30 min); non-finite or non-positive values fall
 //             back to the default. Runtime scales steeply with tier × effort (measured
@@ -87,13 +89,14 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
   const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean' } } }
   const rebaseRefs = node => Array.isArray(node) ? node.map(rebaseRefs)
     : node && typeof node === 'object'
-      ? Object.fromEntries(Object.entries(node).map(([k, v]) =>
-          [k, k === '$ref' && typeof v === 'string' && (v === '#' || v.startsWith('#/'))
-            ? `#/properties/result/anyOf/0${v.slice(1)}` : rebaseRefs(v)]))
+      ? typeof node.$id === 'string' ? node   // own schema resource — its "#…" refs resolve against that $id
+        : Object.fromEntries(Object.entries(node).map(([k, v]) =>
+            [k, k === '$ref' && typeof v === 'string' && (v === '#' || v.startsWith('#/'))
+              ? `#/properties/result/anyOf/0${v.slice(1)}` : rebaseRefs(v)]))
       : node
   const relaySchema = revalidate
     ? { type: 'object', additionalProperties: false, required: ['result'],
-        properties: { result: { anyOf: [schema.$id ? schema : rebaseRefs(schema), sentinel] } } }
+        properties: { result: { anyOf: [rebaseRefs(schema), sentinel] } } }
     : undefined
   return agent(
     `You are a RELAY, not a solver. Do NOT attempt the task yourself, do NOT
