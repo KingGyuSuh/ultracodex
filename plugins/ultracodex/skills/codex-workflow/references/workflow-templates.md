@@ -39,7 +39,11 @@ object.
 //             (e.g. after a watchdog kill) survives strict validation — keep filtering
 //             the sentinel out downstream as always. The envelope exists because
 //             Anthropic's tool input_schema rejects anyOf/oneOf/allOf at the TOP level
-//             (400 before any agent runs); nested one level down it is legal.
+//             (400 before any agent runs); nested one level down it is legal. The
+//             schema's root $defs/definitions are hoisted onto the envelope: root-
+//             relative $refs ("#/$defs/…") resolve from the document root, which the
+//             wrapping moves — without the hoist they'd point to nowhere and every
+//             valid Codex payload would fail re-validation.
 // timeoutMs:  watchdog deadline for the codex run. Default 1200000 (20 min); "ultra"
 //             nodes default to 1800000 (30 min); non-finite or non-positive values fall
 //             back to the default. Runtime scales steeply with tier × effort (measured
@@ -53,7 +57,10 @@ object.
 //             child ignores it, the child is reparented so pkill -P no longer matches
 //             it — and the parent's death also unblocks the wrapper's wait, whose
 //             EXIT trap reaps the watchdog mid-grace, before its KILL pass ever runs.
-//             The trap therefore ends by KILL-sweeping the captured PIDs itself. If
+//             The trap therefore ends by KILL-sweeping the captured PIDs itself. It
+//             also reaps the watchdog together with its blocked `sleep` child, pre-
+//             captured in the same kill — TERMing the subshell alone would reparent
+//             the sleep and leave a deadline-length orphan per successful node. If
 //             the Bash task is cancelled while codex is alive, the same trap first
 //             runs the capture+TERM→KILL escalation (2 s grace — best-effort, the
 //             wrapper is being torn down). The kill -0 guard keeps the normal exit
@@ -71,6 +78,8 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
   const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean' } } }
   const relaySchema = revalidate
     ? { type: 'object', additionalProperties: false, required: ['result'],
+        ...(schema.$defs ? { $defs: schema.$defs } : {}),
+        ...(schema.definitions ? { definitions: schema.definitions } : {}),
         properties: { result: { anyOf: [schema, sentinel] } } }
     : undefined
   return agent(
@@ -113,7 +122,7 @@ CODEX_TASK_EOF
       sleep 2
       pkill -9 -P "$CODEX_PID" 2>/dev/null; kill -9 "$CODEX_PID" 2>/dev/null
     fi
-    kill "$WATCHDOG_PID" 2>/dev/null
+    kill "$WATCHDOG_PID" $(pgrep -P "$WATCHDOG_PID") 2>/dev/null
     [ -s "$KIDSFILE" ] && kill -9 $(cat "$KIDSFILE") 2>/dev/null
   }
   trap cleanup EXIT INT TERM
