@@ -37,7 +37,10 @@ object.
 //             Re-validation wraps the result in a { result: anyOf[schema, sentinel] }
 //             envelope (unwrapped before return) so a legitimate {"_codex_error":true}
 //             (e.g. after a watchdog kill) survives strict validation — keep filtering
-//             the sentinel out downstream as always. The envelope exists because
+//             the sentinel out downstream as always. The sentinel pins _codex_error
+//             to the literal true (enum: [true]): a plain boolean would let a stray
+//             {"_codex_error": false} — matching neither the user schema nor the
+//             error convention — slip through validation and read as data downstream. The envelope exists because
 //             Anthropic's tool input_schema rejects anyOf/oneOf/allOf at the TOP level
 //             (400 before any agent runs); nested one level down it is legal. Root-
 //             relative $refs inside the schema ("#", "#/$defs/…", "#/properties/…")
@@ -60,23 +63,30 @@ object.
 //             ~17 min — the defaults budget headroom, not the mean). The run is ALWAYS
 //             launched as a BACKGROUND Bash call — the Bash tool's foreground cap is
 //             10 min (default 2), and a timeout kill fabricates {"_codex_error":true}.
-//             The in-snippet watchdog TERMs codex and its children at the deadline and
-//             KILLs whatever survives 10 s later. Child PIDs are captured (pgrep -P)
-//             to a temp file BEFORE the TERM: if the parent exits on TERM while a
-//             child ignores it, the child is reparented so pkill -P no longer matches
-//             it — and the parent's death also unblocks the wrapper's wait, whose
-//             EXIT trap reaps the watchdog mid-grace, before its KILL pass ever runs.
-//             The trap therefore ends by KILL-sweeping the captured PIDs itself. It
-//             also reaps the watchdog together with its blocked `sleep` child, pre-
-//             captured in the same kill — TERMing the subshell alone would reparent
-//             the sleep and leave a deadline-length orphan per successful node.
-//             Cancellation (INT/TERM) exits 130/143 through the EXIT trap: cleanup
-//             still runs exactly once (capture+TERM→KILL escalation when codex is
-//             alive, 2 s grace — best-effort, the wrapper is being torn down), but
-//             the interrupted wait no longer falls through to the final cat, which
-//             would disguise a cancelled node as a normal empty result. The kill -0
-//             guard keeps the normal exit path delay-free. (POSIX sleep+kill/pkill/
-//             pgrep because macOS ships neither GNU `timeout` nor `setsid`.)
+//             The in-snippet watchdog TERMs codex and its descendant tree at the
+//             deadline and KILLs survivors 10 s later. Descendants are captured
+//             TRANSITIVELY (kids(): BFS over repeated pgrep -P, depth-capped) to a
+//             temp file BEFORE the TERM — codex runs tools through an intermediate
+//             `bash -lc`, so the real workload sits at depth 2+: when that bash dies
+//             on TERM its children reparent and any single-level pkill -P would never
+//             reach them. The parent's death also unblocks the wrapper's wait, whose
+//             EXIT trap reaps the watchdog mid-grace — so the trap ends by sweeping
+//             the captured list itself. Every DELAYED -9 goes through sweep9(), which
+//             re-checks each captured PID's parentage first (reparented orphan —
+//             ppid 1 — or still inside the captured tree): a PID recycled during the
+//             grace window is not blindly SIGKILLed. Residual caveat: under a
+//             child-subreaper, orphans reparent to the subreaper rather than PID 1
+//             and can escape the sweep — a bounded leak, preferred over -9'ing a
+//             recycled PID. The watchdog is reaped together with its blocked sleep
+//             child (pre-captured in the same kill) — TERMing the subshell alone
+//             would orphan a deadline-length sleep per successful node. Cancellation
+//             (INT/TERM) exits 130/143 through the EXIT trap: cleanup runs exactly
+//             once (tree-capture+TERM→KILL when codex is alive, 2 s grace —
+//             best-effort, the wrapper is being torn down), and the interrupted wait
+//             no longer falls through to the final cat, which would disguise a
+//             cancelled node as a normal empty result. The kill -0 guard keeps the
+//             normal exit path delay-free. (POSIX sleep/kill/pgrep/ps because macOS
+//             ships neither GNU `timeout` nor `setsid`.)
 function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label, timeoutMs } = {}) {
   const flags = [
     model  ? `-m ${model}` : '',
@@ -86,7 +96,7 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
   const schemaJson = JSON.stringify(schema, null, 2)
   const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : (effort === 'ultra' ? 1800000 : 1200000)
   const deadlineSec = Math.ceil(deadlineMs / 1000)
-  const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean' } } }
+  const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean', enum: [true] } } }
   const rebaseRefs = node => Array.isArray(node) ? node.map(rebaseRefs)
     : node && typeof node === 'object'
       ? typeof node.$id === 'string' ? node   // own schema resource — its "#…" refs resolve against that $id
@@ -124,22 +134,39 @@ CODEX_TASK_EOF
   codex exec --skip-git-repo-check -s ${sandbox} ${flags} \\
     --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1 &
   CODEX_PID=$!
+  kids() {
+    F="$1"; D=0
+    while [ -n "$F" ] && [ "$D" -lt 32 ]; do
+      F=$(pgrep -P "$(echo $F | tr ' ' ',')" | tr '\\n' ' ')
+      [ -n "$F" ] && printf '%s\\n' $F
+      D=$((D+1))
+    done
+  }
+  sweep9() {
+    while read -r P; do
+      PP=$(ps -o ppid= -p "$P" 2>/dev/null | tr -d ' ')
+      [ -z "$PP" ] && continue
+      if [ "$PP" = 1 ] || [ "$PP" = "$CODEX_PID" ] || grep -qx "$PP" "$KIDSFILE"; then
+        kill -9 "$P" 2>/dev/null
+      fi
+    done < "$KIDSFILE"
+  }
   ( sleep ${deadlineSec}
-    pgrep -P "$CODEX_PID" > "$KIDSFILE"
-    kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null; pkill -P "$CODEX_PID" 2>/dev/null
+    kids "$CODEX_PID" > "$KIDSFILE"
+    kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
     sleep 10
-    pkill -9 -P "$CODEX_PID" 2>/dev/null
-    kill -9 "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null ) >/dev/null 2>&1 &
+    kids "$CODEX_PID" >> "$KIDSFILE"
+    kill -9 "$CODEX_PID" 2>/dev/null; sweep9 ) >/dev/null 2>&1 &
   WATCHDOG_PID=$!
   cleanup() {
     if kill -0 "$CODEX_PID" 2>/dev/null; then
-      pgrep -P "$CODEX_PID" > "$KIDSFILE"
-      kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null; pkill -P "$CODEX_PID" 2>/dev/null
+      kids "$CODEX_PID" > "$KIDSFILE"
+      kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
       sleep 2
-      pkill -9 -P "$CODEX_PID" 2>/dev/null; kill -9 "$CODEX_PID" 2>/dev/null
+      kill -9 "$CODEX_PID" 2>/dev/null
     fi
     kill "$WATCHDOG_PID" $(pgrep -P "$WATCHDOG_PID") 2>/dev/null
-    [ -s "$KIDSFILE" ] && kill -9 $(cat "$KIDSFILE") 2>/dev/null
+    [ -s "$KIDSFILE" ] && sweep9
   }
   trap cleanup EXIT
   trap 'exit 130' INT
@@ -249,7 +276,7 @@ const candidates = (await parallel([
     .then(s => ({ ...s, author: `claude:${a.key}` }))),
   () => codexNode(`${TASK}\nPropose the approach you think is most robust.`,
         { schema: SOLUTION, label: 'gen:codex' }).then(s => ({ ...s, author: 'codex' })),
-])).filter(Boolean)
+])).filter(Boolean).filter(c => !c._codex_error)   // an errored generator is not a candidate
 
 phase('Judge')
 const judged = await parallel(candidates.map((c, i) => () => parallel([
@@ -257,18 +284,22 @@ const judged = await parallel(candidates.map((c, i) => () => parallel([
   () => codexNode(`Score this approach 0..10 for the problem.\n${JSON.stringify(c)}`, { schema: SCORE, label: `judge:codex:${i}` }),
 ]).then(scores => {
   // exclude errored jurors from the average — never score an infra failure as 0.
+  // an ALL-errored jury is an infra failure too: avg null, excluded from ranking below,
+  // instead of an avg of 0 that silently sorts the candidate last.
   const valid = scores.filter(s => s && !s._codex_error)
-  const avg = valid.reduce((a, s) => a + (s.score ?? 0), 0) / (valid.length || 1)
+  const avg = valid.length ? valid.reduce((a, s) => a + (s.score ?? 0), 0) / valid.length : null
   return { candidate: c, avg, scores: valid }
 })))
 
-const winner = judged.filter(Boolean).sort((a, b) => b.avg - a.avg)[0]
+const ranked = judged.filter(Boolean).filter(j => j.avg !== null).sort((a, b) => b.avg - a.avg)
+const winner = ranked[0]
+if (!winner) { log('every jury errored — nothing rankable'); return { final: null, winner: null, ranking: [] } }
 
 phase('Synthesize')
 const final = await agent(
-  `Write the final approach. Base it on the winner, grafting the best ideas from the runners-up.\nWINNER: ${JSON.stringify(winner.candidate)}\nALL: ${JSON.stringify(judged.filter(Boolean).map(j => ({author: j.candidate.author, avg: j.avg})))}`,
+  `Write the final approach. Base it on the winner, grafting the best ideas from the runners-up.\nWINNER: ${JSON.stringify(winner.candidate)}\nALL: ${JSON.stringify(ranked.map(j => ({author: j.candidate.author, avg: j.avg})))}`,
 )
-return { final, winner: winner.candidate.author, ranking: judged.filter(Boolean).map(j => ({ author: j.candidate.author, avg: j.avg })) }
+return { final, winner: winner.candidate.author, ranking: ranked.map(j => ({ author: j.candidate.author, avg: j.avg })) }
 ```
 
 ---
@@ -307,15 +338,15 @@ return { conclusion, codex_verdict: verdict, trustworthy: verdict && !verdict._c
 
 ## Template 4 — Loop-until-dry with a Codex gate
 
-Iterate Claude-find → Codex-verify until a round surfaces no NEW findings (or a
-max-rounds cap), feeding already-known ids back into the finder as "don't repeat".
-Exhaustion is judged on *confirmed* survivors, not raw Claude output — for thorough
-reviews/audits.
+Iterate Claude-find → Codex-verify until a round adds no new *confirmed* finding
+(or a max-rounds cap), feeding already-known ids back into the finder as "don't
+repeat". Exhaustion is judged on *confirmed* survivors, not raw Claude output — a
+round whose findings Codex refutes wholesale is just as dry as a round with none.
 
 ```js
 export const meta = {
   name: 'loop-until-dry-codex',
-  description: 'Iterate Claude-find -> Codex-verify until a round adds no new findings',
+  description: 'Iterate Claude-find -> Codex-verify until a round adds no new confirmed findings',
   phases: [{ title: 'Hunt' }],
 }
 
@@ -348,13 +379,16 @@ for (let round = 0; round < MAX_ROUNDS; round++) {
     { label: `find:r${round}`, schema: FINDINGS },
   )
   const fresh = (review?.findings ?? []).filter(f => !seen.has(f.id))
-  if (fresh.length === 0) break              // dry round -> done
   fresh.forEach(f => seen.add(f.id))
-  const verdicts = await parallel(fresh.map(f => () =>
+  const verdicts = fresh.length ? await parallel(fresh.map(f => () =>
     codexNode(`Adversarially verify, defaulting to refuted=true if uncertain:\n${f.title}\n${f.detail}`,
-      { schema: VERDICT, label: `codex:${f.id}` }).then(v => ({ ...f, verdict: v }))))
-  confirmed.push(...verdicts.filter(Boolean)
-    .filter(f => f.verdict && !f.verdict._codex_error && f.verdict.refuted === false))
+      { schema: VERDICT, label: `codex:${f.id}` }).then(v => ({ ...f, verdict: v })))) : []
+  const newlyConfirmed = verdicts.filter(Boolean)
+    .filter(f => f.verdict && !f.verdict._codex_error && f.verdict.refuted === false)
+  confirmed.push(...newlyConfirmed)
+  // the gate is CONFIRMED survivors, not raw Claude output: a round Codex refutes
+  // wholesale is dry, and a round with no fresh findings is trivially dry too.
+  if (newlyConfirmed.length === 0) break
 }
 return { confirmed, rounds_used: roundsUsed }
 ```
@@ -419,7 +453,9 @@ never as a pass/refute:
 - Always `.filter(Boolean)` to drop null agent returns, **then** drop any result
   where `_codex_error` is true, **before** any aggregation.
 - In a judge panel, **exclude** errored jurors from the average — scoring them `0`
-  silently penalizes the candidate for an infra failure (Template 2 does this).
+  silently penalizes the candidate for an infra failure. An **all-errored jury is
+  no verdict at all**: mark it (`avg: null`) and keep the candidate out of the
+  ranking rather than letting an implicit `0` sort it last (Template 2 does both).
 - If more than a small fraction of nodes return `_codex_error` in a run, stop and
   re-run the preflight — that signals auth expiry or a bad schema, not flakiness.
 
