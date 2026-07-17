@@ -93,7 +93,7 @@ the top of `references/workflow-templates.md` — paste it once near the top of 
 script):
 
 ```
-codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label })
+codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidate=true, phase, label, timeoutMs=1200000 })
   → Promise<parsedObject>
 ```
 
@@ -106,8 +106,21 @@ codexNode(taskText, { schema, sandbox='read-only', model, cwd, effort, revalidat
   Sol/Terra). **model** — optional model override (`-m`; use fully-qualified tier
   IDs like `gpt-5.6-sol`/`-terra`/`-luna`). Both are open, per-node choices — see
   "Picking tier & effort per node" below.
+- **timeoutMs** — watchdog deadline for the codex run: default 1200000 ms
+  (20 min), and `ultra` nodes default to 1800000 (30 min); non-finite or
+  non-positive values fall back to the default. The helper always launches
+  codex as a **background** Bash call with an in-snippet watchdog (TERM to
+  codex and its children at the deadline, KILL 10 s later, plus an exit trap
+  that repeats the escalation if the Bash task is cancelled mid-run)
+  — the foreground Bash cap is 10 min (default 2 min, which kills anything
+  beyond a routine verify and fabricates `_codex_error`), while measured
+  real-task runs reach ~8–17 min at high efforts.
 - **returns** a parsed object matching `schema`, or `{ _codex_error: true }` on
   failure (always filter that out before aggregating — see codex-headless.md).
+  Internally re-validation uses a `{ result: anyOf[schema, sentinel] }`
+  envelope, unwrapped before return: the sentinel must survive
+  `revalidate: true`, and Anthropic's tool input_schema rejects top-level
+  `anyOf`/`oneOf`/`allOf` (400), so the union nests one level down.
 - **invariant** — self-contained: the Bash-capable subagent writes schema + task
   to temp files because Workflow JS has no filesystem.
 
@@ -124,7 +137,9 @@ of the helper):
    and `cat "$OUT"`.
 3. **Pass the prompt via stdin (`- < "$TASK"`), not as a shell argument.** Task
    text contains quotes, `$`, and backticks that would break or expand inside a
-   double-quoted arg. The heredoc + stdin path is quoting-proof.
+   double-quoted arg. The helper writes the task to a temp file via a single-quoted
+   heredoc with a collision-proof delimiter, then pipes it via stdin — quoting- and
+   injection-proof even for untrusted task text.
 
 `revalidate: true` (the default) re-validates Codex's JSON and returns a parsed
 object — best for small structured payloads (verdicts, scores), immune to schema
@@ -174,6 +189,13 @@ an emergency lever. Typical shape:
   held slot for the strongest verdict — or a Pattern B worker; never a wide
   fan-out (it holds a slot and burns quota fast).
 
+Mind the clock as much as the cost: runtime scales with tier × effort as
+steeply as depth does. Measured on real tasks, sol runs ~8 min at `max` and
+~14–17 min at `xhigh`/`ultra` — which is why the helper runs every codex node
+as a background Bash call with a generous watchdog deadline (20 min default,
+30 at `ultra`; see the `timeoutMs` bullet above), and why a held slot at
+`ultra` is a real price.
+
 Tier table, caveats (fully-qualified IDs on ChatGPT auth, ~372K effective
 context), and the full ladder: `references/codex-headless.md` → "Model tiers &
 reasoning effort".
@@ -185,7 +207,14 @@ for Codex's *entire* runtime, with the Claude wrapper sitting idle on a blocking
 Bash call. So:
 
 - Use Codex nodes for **short** work — verify, judge, small generation
-  (seconds, read-only). A typical structured verify is a few seconds.
+  (read-only). A routine structured verify at `low`/`medium` returns in seconds
+  to a couple of minutes; at flagship tier × high effort it is minutes-to-tens-
+  of-minutes (measured: sol@`max` ~8 min, sol@`xhigh`/`ultra` ~14–17 min).
+- **Set real timeouts.** A foreground Bash call defaults to a 2-minute timeout
+  and caps at 10 — enough only for routine verifies; a timeout kill surfaces as
+  a fake `_codex_error`. The helper therefore runs every codex node as a
+  background Bash call with a watchdog deadline (`timeoutMs`, default 20 min;
+  30 at `ultra`).
 - **Never** put a long multi-minute Codex *implementation* inside a Workflow
   node — it starves the slot pool while idling. That is Pattern B (below).
 - Many short codex nodes simply queue at the cap; that is fine.

@@ -34,35 +34,241 @@ object.
 //             (low→xhigh; GPT-5.6 tiers also take "max", and "ultra" on sol/terra).
 // model:      optional -m override; use fully-qualified tier IDs (gpt-5.6-sol/-terra/-luna).
 // revalidate: default true; set false for large payloads and JSON.parse the string yourself.
-function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label } = {}) {
+//             Re-validation wraps the result in a { result: anyOf[schema, sentinel] }
+//             envelope (unwrapped before return) so a legitimate {"_codex_error":true}
+//             (e.g. after a watchdog kill) survives strict validation — keep filtering
+//             the sentinel out downstream as always. The sentinel pins _codex_error
+//             to the literal true (enum: [true]): a plain boolean would let a stray
+//             {"_codex_error": false} — matching neither the user schema nor the
+//             error convention — slip through validation and read as data downstream. The envelope exists because
+//             Anthropic's tool input_schema rejects anyOf/oneOf/allOf at the TOP level
+//             (400 before any agent runs); nested one level down it is legal. Root-
+//             relative $refs inside the schema ("#", "#/$defs/…", "#/properties/…")
+//             are rebased onto the embedded location ("#/properties/result/anyOf/0…"):
+//             wrapping moves the document root, so unrebased they'd resolve against
+//             the envelope — broken refs for $defs, and for recursive self-refs a
+//             validator that rejects every valid payload. Only whole-resource /
+//             JSON-pointer refs ("", "#", "#/…" — "" and "#" both name the resource
+//             root) are rebased; named-anchor refs ("#name", paired with
+//             $anchor) are left intact — anchors resolve by name within the schema
+//             resource, so they survive relocation and rewriting would corrupt them.
+//             And only in SCHEMA positions: values under const/enum/default/examples
+//             are data (a "$ref" there is a literal, not a reference), and property
+//             maps (properties/$defs/…) are walked as name→schema maps so a property
+//             literally named "$ref" or "const" is not misread as a keyword.
+//             $recursiveRef/$dynamicRef are deliberately left untouched: OpenAI's
+//             structured-outputs schema subset rejects them, so codex --output-schema
+//             fails such a schema upfront and it never reaches re-validation.
+//             Codex itself still gets the ORIGINAL schema file (there the schema IS
+//             the root). Rebasing stops at any subschema carrying a string $id —
+//             root or nested (e.g. under $defs): it forms its own schema resource,
+//             its "#…" refs already resolve against that $id wherever it sits, and
+//             rewriting them would corrupt it.
+// timeoutMs:  watchdog deadline for the codex run. Default 1200000 (20 min); "ultra"
+//             nodes default to 1800000 (30 min); non-finite or non-positive values fall
+//             back to the default. Runtime scales steeply with tier × effort (measured
+//             on real tasks, codex 0.144.0: sol@max ~8 min, sol@xhigh ~14 min, sol@ultra
+//             ~17 min — the defaults budget headroom, not the mean). The run is ALWAYS
+//             launched as a BACKGROUND Bash call — the Bash tool's foreground cap is
+//             10 min (default 2), and a timeout kill fabricates {"_codex_error":true}.
+//             The in-snippet watchdog TERMs codex and its descendant tree at the
+//             deadline and KILLs survivors 10 s later. Teardown is layered. Layer 1:
+//             codex is launched under bash job control (set -m), giving it its own
+//             process group — group kills (kill -- -PGID) reach every descendant
+//             atomically, INCLUDING reparented orphans (pgid survives reparenting)
+//             and workers codex backgrounds before exiting NORMALLY: the trap ends
+//             with an unconditional group -9 (a no-op when the group is empty, so
+//             the normal path stays delay-free; the pgid cannot be recycled while
+//             any member lives). On the deadline path, group survivors get whatever
+//             grace codex's own death took — tearing down a timed-out node
+//             prioritizes not leaking over graceful shutdown. Layer 2, for pgid
+//             escapees (a tool calling setsid):
+//             descendants are also captured TRANSITIVELY (kids(): BFS over repeated
+//             pgrep -P, depth-capped) to a temp file BEFORE the TERM — codex runs
+//             tools through an intermediate `bash -lc`, so the real workload sits at
+//             depth 2+: when that bash dies on TERM its children reparent and any
+//             single-level pkill -P would never reach them. The parent's death also
+//             unblocks the wrapper's wait, whose
+//             EXIT trap reaps the watchdog mid-grace — so the trap ends by sweeping
+//             the captured list itself. Before each final sweep, regrow() re-expands
+//             the capture from still-alive captured PIDs — not just the (possibly
+//             dead) codex root — so work a TERM-resistant survivor forked during the
+//             grace window is swept too (best-effort: a tree that keeps forking can
+//             always race a POSIX sweep). Every DELAYED -9 goes through sweep9(), which
+//             re-checks each captured PID's parentage first (reparented orphan —
+//             ppid 1 — or still inside the captured tree): a PID recycled during the
+//             grace window is not blindly SIGKILLed. Residual caveats, both bounded
+//             and deliberate: (a) under a child-subreaper, orphans reparent to the
+//             subreaper rather than PID 1 and can escape the sweep — preferred over
+//             -9'ing a recycled PID; (b) a descendant that BOTH escapes the pgid (its
+//             own setsid) AND outlives a NORMAL codex exit is not hunted — Layer 2's
+//             capture only runs while codex is alive or on the deadline path, and such
+//             a process is an intentional detached daemon indistinguishable from one a
+//             tool meant to leave running (a read-only verify node should not be
+//             spawning these anyway). Timed-out runs still attempt it. The watchdog is
+//             reaped together with its blocked sleep
+//             child (pre-captured in the same kill) — TERMing the subshell alone
+//             would orphan a deadline-length sleep per successful node. cleanup is
+//             called EXPLICITLY after wait (not left to the EXIT trap): the Bash
+//             tool runs this in a persistent shell, where an EXIT trap fires only
+//             when the shell itself exits, not at command end — so relying on it
+//             would leave the watchdog armed until the deadline on every normal
+//             completion. A run-once flag makes the still-armed EXIT trap (kept only
+//             as a safety net for an uncontrolled exit) idempotent, so a later
+//             firing can't -9 a recycled pgid. Cancellation (INT/TERM) runs cleanup
+//             then exits 130/143 (tree-capture+TERM→KILL when codex is alive, 2 s
+//             grace — best-effort, the wrapper is being torn down), and the
+//             interrupted wait no longer falls through to the final cat, which would
+//             disguise a cancelled node as a normal empty result. The kill -0 guard
+//             keeps the normal exit path delay-free. (POSIX sleep/kill/pgrep/ps plus bash job
+//             control, because macOS ships neither GNU `timeout` nor `setsid` — set -m
+//             provides the killable group without either.) The whole snippet runs
+//             under `bash <<'…'`: the Bash tool executes in the user's LOGIN shell —
+//             zsh on macOS — which rejects `set -m` (can't change option: -m) and
+//             word-splits differently, so without the bash wrapper the teardown
+//             breaks and codex can be killed before it even starts.
+function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label, timeoutMs } = {}) {
   const flags = [
     model  ? `-m ${model}` : '',
     cwd    ? `-C "${cwd}"` : '',   // quote: cwd is an arbitrary path and may contain spaces
     effort ? `-c model_reasoning_effort="${effort}"` : '',
   ].filter(Boolean).join(' ')
   const schemaJson = JSON.stringify(schema, null, 2)
+  // Embed schema+task via single-quoted heredocs whose delimiters are computed to be
+  // ABSENT from the content (extended until no standalone line matches). A quoted
+  // heredoc does no expansion, and a delimiter that cannot appear cannot be used to
+  // close the heredoc early — so untrusted task text (e.g. reviewed repo content
+  // flowing through a finding into taskText) can neither expand nor break out to run
+  // in the relay's shell, outside codex's read-only sandbox. (Base64 would also work
+  // but the workflow runtime exposes no Buffer/btoa/TextEncoder to encode with.)
+  const uniqEof = (base, text) => { let d = base; const ls = text.split('\n'); while (ls.includes(d)) d += '_' + ls.length; return d }
+  const SCHEMA_EOF = uniqEof('CODEX_SCHEMA_EOF', schemaJson)
+  const TASK_EOF = uniqEof('CODEX_TASK_EOF', taskText)
+  const RUN_EOF = uniqEof('CODEX_RUN_EOF', schemaJson + '\n' + taskText)
+  const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : (effort === 'ultra' ? 1800000 : 1200000)
+  const deadlineSec = Math.ceil(deadlineMs / 1000)
+  const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean', enum: [true] } } }
+  const DATA_KEYS = ['const', 'enum', 'default', 'examples']   // keyword values that hold DATA, not schemas
+  const MAP_KEYS = ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas',
+    'dependencies']   // draft-07 dependencies: name→schema map too (its array-of-names form passes through as strings)
+  const rebaseRefs = (node, isMap) => {
+    if (Array.isArray(node)) return node.map(v => rebaseRefs(v))
+    if (!node || typeof node !== 'object') return node
+    if (!isMap && typeof node.$id === 'string') return node    // own schema resource — its "#…" refs resolve against that $id
+    return Object.fromEntries(Object.entries(node).map(([k, v]) => {
+      if (isMap) return [k, rebaseRefs(v)]                     // map keys are property NAMES; values are schemas
+      if (DATA_KEYS.includes(k)) return [k, v]                 // a "$ref" inside const/enum is data, not a reference
+      if (k === '$ref' && typeof v === 'string' && (v === '' || v === '#' || v.startsWith('#/')))
+        return [k, `#/properties/result/anyOf/0${v.slice(1)}`]   // "" and "#" both name the resource root; slice(1) is "" for each
+      return [k, rebaseRefs(v, MAP_KEYS.includes(k))]
+    }))
+  }
+  const relaySchema = revalidate
+    ? { type: 'object', additionalProperties: false, required: ['result'],
+        properties: { result: { anyOf: [rebaseRefs(schema), sentinel] } } }
+    : undefined
   return agent(
     `You are a RELAY, not a solver. Do NOT attempt the task yourself, do NOT
 reason about it, do NOT use your own judgment. Your only job is to run Codex on
 the task below and return Codex's JSON verbatim. If you answer it yourself the
 whole point — a second, independent model — is defeated.
 
-Run exactly this (the heredocs write the schema and task to temp files):
-  SCHEMA=$(mktemp); TASK=$(mktemp); OUT=$(mktemp)
-  cat > "$SCHEMA" <<'CODEX_SCHEMA_EOF'
+Codex runs for many minutes at higher reasoning efforts (real-task runs measured
+~8–17 min — past the 10-minute foreground Bash cap, let alone the 2-minute
+default, and a timeout kill fabricates a fake error). So launch the snippet
+below as ONE Bash call with run_in_background: true — NEVER as a foreground
+call — then WAIT for that background task to actually EXIT before you read its
+output. This is the step that most often goes wrong: the output file stays
+EMPTY for the whole run and only fills at the very end, so do NOT check once,
+see empty, and give up — that returns a false {"_codex_error": true} while
+codex is still working. Keep waiting (you are re-invoked when the task exits;
+if you must poll, sleep in a loop and re-check the task's status, never the file
+alone) until the background task's status is genuinely 'completed'. Only then
+read its collected output. Return {"_codex_error": true} solely when the task
+has EXITED and its output is still empty. The watchdog inside the snippet kills
+codex after ${deadlineSec}s if it runs away (TERM, then KILL 10 s later), so the
+wait is bounded — you will never block forever. The snippet prints nothing except
+the final cat, so the task's collected output IS the JSON — retrieve it and return it.
+
+The snippet runs the whole thing under bash via a heredoc, because the Bash tool
+executes commands in the user's LOGIN shell — zsh on macOS — where "set -m" is
+rejected (can't change option: -m) and unquoted word-splitting differs, which
+silently breaks the process-group teardown and can kill codex before it starts.
+The outer 'bash <<' delimiter is likewise computed to never appear in the body.
+(schema and task go into inner single-quoted heredocs whose delimiters are also
+collision-proof, so untrusted task text can neither expand nor close a heredoc
+early; the exec makes "prints nothing" literal — bash job-death notices like
+"Terminated: 15" would otherwise leak into the collected output around the JSON):
+  bash <<'${RUN_EOF}'
+  SCHEMA=$(mktemp); TASK=$(mktemp); OUT=$(mktemp); KIDSFILE=$(mktemp)
+  exec 2>/dev/null
+  cat > "$SCHEMA" <<'${SCHEMA_EOF}'
 ${schemaJson}
-CODEX_SCHEMA_EOF
-  cat > "$TASK" <<'CODEX_TASK_EOF'
+${SCHEMA_EOF}
+  cat > "$TASK" <<'${TASK_EOF}'
 ${taskText}
-CODEX_TASK_EOF
+${TASK_EOF}
+  set -m
   codex exec --skip-git-repo-check -s ${sandbox} ${flags} \\
-    --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1
-  cat "$OUT"
+    --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1 &
+  CODEX_PID=$!
+  set +m
+  kids() {
+    F="$1"; D=0
+    while [ -n "$F" ] && [ "$D" -lt 32 ]; do
+      F=$(pgrep -P "$(echo $F | tr ' ' ',')" | tr '\\n' ' ')
+      [ -n "$F" ] && printf '%s\\n' $F
+      D=$((D+1))
+    done
+  }
+  sweep9() {
+    while read -r P; do
+      PP=$(ps -o ppid= -p "$P" 2>/dev/null | tr -d ' ')
+      [ -z "$PP" ] && continue
+      if [ "$PP" = 1 ] || [ "$PP" = "$CODEX_PID" ] || grep -qx "$PP" "$KIDSFILE"; then
+        kill -9 "$P" 2>/dev/null
+      fi
+    done < "$KIDSFILE"
+  }
+  regrow() {
+    SURV=$(while read -r P; do kill -0 "$P" 2>/dev/null && printf '%s ' "$P"; done < "$KIDSFILE")
+    [ -n "$SURV" ] && kids "$SURV" >> "$KIDSFILE"
+  }
+  ( sleep ${deadlineSec}
+    kids "$CODEX_PID" > "$KIDSFILE"
+    kill -- -"$CODEX_PID" 2>/dev/null; kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
+    sleep 10
+    kids "$CODEX_PID" >> "$KIDSFILE"
+    regrow
+    kill -9 -- -"$CODEX_PID" 2>/dev/null; kill -9 "$CODEX_PID" 2>/dev/null; sweep9 ) >/dev/null 2>&1 &
+  WATCHDOG_PID=$!
+  CLEANED=
+  cleanup() {
+    [ -n "$CLEANED" ] && return; CLEANED=1        # run once: a later EXIT-trap firing must not -9 a recycled pgid
+    if kill -0 "$CODEX_PID" 2>/dev/null; then
+      kids "$CODEX_PID" > "$KIDSFILE"
+      kill -- -"$CODEX_PID" 2>/dev/null; kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
+      sleep 2
+      kill -9 "$CODEX_PID" 2>/dev/null
+    fi
+    kill "$WATCHDOG_PID" $(pgrep -P "$WATCHDOG_PID") 2>/dev/null
+    kill -9 -- -"$CODEX_PID" 2>/dev/null
+    if [ -s "$KIDSFILE" ]; then regrow; sweep9; fi
+  }
+  trap cleanup EXIT                               # safety net for an uncontrolled shell exit only
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  wait "$CODEX_PID"
+  cleanup                                         # explicit: the Bash tool's shell persists, so EXIT may not
+  cat "$OUT"                                       # fire at command end — reap the watchdog+group NOW, not at the deadline
+${RUN_EOF}
 
 Return EXACTLY the contents of "$OUT" — no prose, no markdown fences. If "$OUT"
-is empty or codex errored, return the literal: {"_codex_error": true}`,
-    { label: label ?? 'codex', phase, schema: revalidate ? schema : undefined },
-  )
+is empty or codex errored, return the literal: {"_codex_error": true}
+If you are given a structured-output tool whose schema has a "result" field,
+pass that JSON (or the error literal) as the value of "result".`,
+    { label: label ?? 'codex', phase, schema: relaySchema },
+  ).then(r => (r && typeof r === 'object' && r.result !== undefined) ? r.result : r)
 }
 ```
 
@@ -159,26 +365,40 @@ const candidates = (await parallel([
     .then(s => ({ ...s, author: `claude:${a.key}` }))),
   () => codexNode(`${TASK}\nPropose the approach you think is most robust.`,
         { schema: SOLUTION, label: 'gen:codex' }).then(s => ({ ...s, author: 'codex' })),
-])).filter(Boolean)
+])).filter(Boolean).filter(c => !c._codex_error)   // an errored generator is not a candidate
 
 phase('Judge')
 const judged = await parallel(candidates.map((c, i) => () => parallel([
   () => agent(`Score this approach 0..10 for the problem.\n${JSON.stringify(c)}`, { label: `judge:claude:${i}`, schema: SCORE }),
   () => codexNode(`Score this approach 0..10 for the problem.\n${JSON.stringify(c)}`, { schema: SCORE, label: `judge:codex:${i}` }),
-]).then(scores => {
-  // exclude errored jurors from the average — never score an infra failure as 0.
-  const valid = scores.filter(s => s && !s._codex_error)
-  const avg = valid.reduce((a, s) => a + (s.score ?? 0), 0) / (valid.length || 1)
-  return { candidate: c, avg, scores: valid }
+]).then(([claudeScore, codexScore]) => {
+  // tag each juror with its model family and drop errored ones (never score an infra
+  // failure as 0). The panel's whole point is that no candidate is judged only by its
+  // OWN family: if the cross-family juror errored and only the author's family survived,
+  // that is not a valid verdict — avg null (excluded from ranking), same as all-errored.
+  const authorFamily = c.author.split(':')[0]
+  const valid = [
+    claudeScore && !claudeScore._codex_error ? { ...claudeScore, family: 'claude' } : null,
+    codexScore  && !codexScore._codex_error  ? { ...codexScore,  family: 'codex'  } : null,
+  ].filter(Boolean)
+  const jury = valid.some(s => s.family !== authorFamily) ? valid : []
+  const avg = jury.length ? jury.reduce((a, s) => a + (s.score ?? 0), 0) / jury.length : null
+  return { candidate: c, avg, scores: jury }
 })))
 
-const winner = judged.filter(Boolean).sort((a, b) => b.avg - a.avg)[0]
+const ranked = judged.filter(Boolean).filter(j => j.avg !== null).sort((a, b) => b.avg - a.avg)
+const winner = ranked[0]
+if (!winner) { log('no candidate got a valid cross-family verdict — nothing rankable'); return { final: null, winner: null, ranking: [] } }
 
 phase('Synthesize')
 const final = await agent(
-  `Write the final approach. Base it on the winner, grafting the best ideas from the runners-up.\nWINNER: ${JSON.stringify(winner.candidate)}\nALL: ${JSON.stringify(judged.filter(Boolean).map(j => ({author: j.candidate.author, avg: j.avg})))}`,
+  // pass the runners-up's FULL content, not just author+avg — "graft the best ideas"
+  // is impossible if the synthesizer can only see who ranked where, not what they proposed.
+  `Write the final approach. Base it on the winner, grafting the best ideas from the runners-up.\n` +
+  `WINNER: ${JSON.stringify(winner.candidate)}\n` +
+  `RUNNERS_UP: ${JSON.stringify(ranked.slice(1).map(j => j.candidate))}`,
 )
-return { final, winner: winner.candidate.author, ranking: judged.filter(Boolean).map(j => ({ author: j.candidate.author, avg: j.avg })) }
+return { final, winner: winner.candidate.author, ranking: ranked.map(j => ({ author: j.candidate.author, avg: j.avg })) }
 ```
 
 ---
@@ -217,15 +437,15 @@ return { conclusion, codex_verdict: verdict, trustworthy: verdict && !verdict._c
 
 ## Template 4 — Loop-until-dry with a Codex gate
 
-Iterate Claude-find → Codex-verify until a round surfaces no NEW findings (or a
-max-rounds cap), feeding already-known ids back into the finder as "don't repeat".
-Exhaustion is judged on *confirmed* survivors, not raw Claude output — for thorough
-reviews/audits.
+Iterate Claude-find → Codex-verify until a round adds no new *confirmed* finding
+(or a max-rounds cap), feeding already-known ids back into the finder as "don't
+repeat". Exhaustion is judged on *confirmed* survivors, not raw Claude output — a
+round whose findings Codex refutes wholesale is just as dry as a round with none.
 
 ```js
 export const meta = {
   name: 'loop-until-dry-codex',
-  description: 'Iterate Claude-find -> Codex-verify until a round adds no new findings',
+  description: 'Iterate Claude-find -> Codex-verify until a round adds no new confirmed findings',
   phases: [{ title: 'Hunt' }],
 }
 
@@ -258,13 +478,28 @@ for (let round = 0; round < MAX_ROUNDS; round++) {
     { label: `find:r${round}`, schema: FINDINGS },
   )
   const fresh = (review?.findings ?? []).filter(f => !seen.has(f.id))
-  if (fresh.length === 0) break              // dry round -> done
   fresh.forEach(f => seen.add(f.id))
-  const verdicts = await parallel(fresh.map(f => () =>
+  const verdicts = fresh.length ? await parallel(fresh.map(f => () =>
     codexNode(`Adversarially verify, defaulting to refuted=true if uncertain:\n${f.title}\n${f.detail}`,
-      { schema: VERDICT, label: `codex:${f.id}` }).then(v => ({ ...f, verdict: v }))))
-  confirmed.push(...verdicts.filter(Boolean)
-    .filter(f => f.verdict && !f.verdict._codex_error && f.verdict.refuted === false))
+      { schema: VERDICT, label: `codex:${f.id}` }).then(v => ({ ...f, verdict: v })))) : []
+  const usable = verdicts.filter(Boolean).filter(f => f.verdict && !f.verdict._codex_error)
+  // an errored verdict is NO verdict: a round whose verdicts ALL errored is an infra
+  // failure (auth expiry, bad schema, watchdog kill) — surface it, never exit as "dry".
+  if (fresh.length > 0 && usable.length === 0)
+    throw new Error(`round ${roundsUsed}: every Codex verdict errored — re-run the preflight`)
+  // partially errored/lost verdicts: un-see those findings so a later round can
+  // re-surface them — a transient failure must not permanently drop an unverified finding.
+  const usableIds = new Set(usable.map(f => f.id))
+  const unjudged = fresh.filter(f => !usableIds.has(f.id))
+  unjudged.forEach(f => seen.delete(f.id))
+  if (unjudged.length)
+    log(`round ${roundsUsed}: ${unjudged.length}/${fresh.length} verdicts errored or lost — returned to the pool`)
+  const newlyConfirmed = usable.filter(f => f.verdict.refuted === false)
+  confirmed.push(...newlyConfirmed)
+  // the gate is CONFIRMED survivors, not raw Claude output — and only a FULLY-judged
+  // round may declare dry: every fresh finding has a usable verdict and none was
+  // confirmed. (A round with no fresh findings is trivially dry.)
+  if (newlyConfirmed.length === 0 && unjudged.length === 0) break
 }
 return { confirmed, rounds_used: roundsUsed }
 ```
@@ -329,7 +564,9 @@ never as a pass/refute:
 - Always `.filter(Boolean)` to drop null agent returns, **then** drop any result
   where `_codex_error` is true, **before** any aggregation.
 - In a judge panel, **exclude** errored jurors from the average — scoring them `0`
-  silently penalizes the candidate for an infra failure (Template 2 does this).
+  silently penalizes the candidate for an infra failure. An **all-errored jury is
+  no verdict at all**: mark it (`avg: null`) and keep the candidate out of the
+  ranking rather than letting an implicit `0` sort it last (Template 2 does both).
 - If more than a small fraction of nodes return `_codex_error` in a run, stop and
   re-run the preflight — that signals auth expiry or a bad schema, not flakiness.
 
@@ -339,6 +576,12 @@ Full failure-mode table in `codex-headless.md` → Troubleshooting.
 
 - **Keep Codex nodes short** (read-only verify/judge/small-gen). They hold a
   concurrency slot for Codex's full runtime — do not put long implementations here.
+- **Give codex real time.** The helper launches every codex run as a background
+  Bash call with a sleep+kill watchdog: `timeoutMs` defaults to 20 min, and
+  `ultra` nodes get 30 (measured real-task runs: sol@`max` ~8 min, sol@`xhigh`
+  ~14 min, sol@`ultra` ~17 min — the defaults budget headroom, not the mean).
+  A foreground Bash call — 10-minute cap, 2-minute default — would kill
+  high-effort runs mid-flight and fabricate `{"_codex_error":true}`.
 - **Schemas must be strict** — set `additionalProperties: false` **and** list
   *every* key from `properties` in `required` (OpenAI's structured-output backend
   400s on a partial `required` *before the run starts* — strict mode has no

@@ -58,7 +58,16 @@ sub-agent task delegation; Luna's catalog omits it, yet passing it anyway is
 *silently accepted*, not rejected — see the caveats below). All are legitimate options; a structured verify is
 a few K tokens — cents even at flagship rates (sol $5/$30, terra $2.50/$15,
 luna $1/$6 per 1M in/out) — so `max` is a reasonable pick for a hard node, not
-a last resort. Typical mappings, not rules:
+a last resort.
+
+**Runtime scales as steeply as depth.** Measured on real verify/review tasks
+(codex 0.144.0, ChatGPT auth): `gpt-5.6-sol` ran **~8 min at `max`**, **~14 min
+at `xhigh`**, and **~8–17 min at `ultra`** (trivial prompts still return in
+under a minute at any effort). Two practical consequences for Pattern A: codex
+must never run on a foreground Bash timeout (2-minute default, 10-minute cap —
+the `codexNode` helper launches every run as a background Bash call with a
+sleep+kill watchdog, 20 min by default and 30 at `ultra`), and a held Workflow
+slot lasts exactly that long. Typical mappings, not rules:
 
 - **Wide verify/judge fan-outs** → `gpt-5.6-luna` or `gpt-5.6-terra` at `low`/`medium` —
   the per-node cost drop compounds across the fan-out.
@@ -166,11 +175,13 @@ Two adjacent failure shapes worth understanding:
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | Empty `-o` file | auth expired, or the model failed schema validation | Re-run the preflight; capture stderr (gotcha #2) to see the real error. |
+| Node dies at ~2 min (or exactly the pinned deadline) with empty `-o` | a **Bash timeout** killed codex mid-run — foreground Bash defaults to 120 s and caps at 600 s; high-effort runs measured ~8–17 min | Never run codex foreground: launch it as a background Bash call with a watchdog deadline (the helper does — `timeoutMs` default 20 min, 30 at `ultra`; raise it per node if a run legitimately needs more). A timeout kill is a fake `_codex_error` — never read it as refuted/flaky. |
 | OpenAI 400 before any output (`-o` never written) | strict schema with a partial `required` — a key in `properties` is missing from `required` | List **every** `properties` key in `required`; strict mode has no optional keys. |
+| Anthropic 400 before any agent runs (`input_schema does not support oneOf, allOf, or anyOf at the top level`) | the Workflow `agent()` re-validation schema has a top-level union | Top level must be a plain `type:'object'` schema — nest the union one level down (the helper's `{ result: anyOf[schema, sentinel] }` envelope does exactly this). |
 | Node returns `{"_codex_error":true}` | codex exited non-zero or `-o` was empty | Treat as "no result" and filter it **before** aggregating — never as pass/refute (gotcha #5). |
 | Session header on stderr but malformed JSON in `-o` | schema too loose | Tighten with `additionalProperties:false` + `required`; keep `revalidate:true` for small payloads. |
 | `codex login` / auth error in `exec` | not authenticated | Run `codex login` interactively — it cannot be done headlessly. |
-| Node hangs / a slot stays busy for minutes | a long task slipped into a Workflow node | Move it to Pattern B (background pool); Workflow nodes are for short reads. |
+| A slot stays busy past the node's watchdog deadline — or "for minutes" at `low`/`medium` | a true hang, or a long task slipped into a Workflow node. NB: ~8–17 min is *normal* at flagship tier × high effort — that alone is not a hang | If the runtime fits the node's tier × effort expectation, wait — that's what the watchdog deadline budgets for. Otherwise move the work to Pattern B (background pool); Workflow nodes are for short reads. |
 | Verify/judge nodes are slow or expensive | reasoning effort defaulting high for a "short" node | Pin `effort: 'medium'` (or `'low'`) on `codexNode` → `-c model_reasoning_effort`, and/or drop the tier (`model: 'gpt-5.6-luna'`) — this changes whether a node is actually short. See "Model tiers & reasoning effort". |
 | `-m` accepted but the run 400s (`model is not supported`) | alias or shorthand model name on ChatGPT-account auth | Use the fully-qualified tier ID (`gpt-5.6-sol` / `-terra` / `-luna`); the banner echoes whatever you passed, so only a completed run proves the model. |
 | Run 400s with `unsupported_value` on `reasoning.effort` | effort name outside the 5.6 catalog (e.g. `minimal` from the general config docs) | Use catalog names only (`low`→`xhigh`, `max`, `ultra` on Sol/Terra). Note the asymmetry: `ultra` on Luna does **not** 400 — it runs with the banner echoing `ultra` (see caveats), so a clean exit is not proof the effort engaged. |
