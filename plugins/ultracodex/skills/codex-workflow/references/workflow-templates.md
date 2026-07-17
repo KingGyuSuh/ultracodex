@@ -108,13 +108,19 @@ object.
 //             spawning these anyway). Timed-out runs still attempt it. The watchdog is
 //             reaped together with its blocked sleep
 //             child (pre-captured in the same kill) — TERMing the subshell alone
-//             would orphan a deadline-length sleep per successful node. Cancellation
-//             (INT/TERM) exits 130/143 through the EXIT trap: cleanup runs exactly
-//             once (tree-capture+TERM→KILL when codex is alive, 2 s grace —
-//             best-effort, the wrapper is being torn down), and the interrupted wait
-//             no longer falls through to the final cat, which would disguise a
-//             cancelled node as a normal empty result. The kill -0 guard keeps the
-//             normal exit path delay-free. (POSIX sleep/kill/pgrep/ps plus bash job
+//             would orphan a deadline-length sleep per successful node. cleanup is
+//             called EXPLICITLY after wait (not left to the EXIT trap): the Bash
+//             tool runs this in a persistent shell, where an EXIT trap fires only
+//             when the shell itself exits, not at command end — so relying on it
+//             would leave the watchdog armed until the deadline on every normal
+//             completion. A run-once flag makes the still-armed EXIT trap (kept only
+//             as a safety net for an uncontrolled exit) idempotent, so a later
+//             firing can't -9 a recycled pgid. Cancellation (INT/TERM) runs cleanup
+//             then exits 130/143 (tree-capture+TERM→KILL when codex is alive, 2 s
+//             grace — best-effort, the wrapper is being torn down), and the
+//             interrupted wait no longer falls through to the final cat, which would
+//             disguise a cancelled node as a normal empty result. The kill -0 guard
+//             keeps the normal exit path delay-free. (POSIX sleep/kill/pgrep/ps plus bash job
 //             control, because macOS ships neither GNU `timeout` nor `setsid` — set -m
 //             provides the killable group without either.)
 function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label, timeoutMs } = {}) {
@@ -210,7 +216,9 @@ collected output around the final JSON):
     regrow
     kill -9 -- -"$CODEX_PID" 2>/dev/null; kill -9 "$CODEX_PID" 2>/dev/null; sweep9 ) >/dev/null 2>&1 &
   WATCHDOG_PID=$!
+  CLEANED=
   cleanup() {
+    [ -n "$CLEANED" ] && return; CLEANED=1        # run once: a later EXIT-trap firing must not -9 a recycled pgid
     if kill -0 "$CODEX_PID" 2>/dev/null; then
       kids "$CODEX_PID" > "$KIDSFILE"
       kill -- -"$CODEX_PID" 2>/dev/null; kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
@@ -221,11 +229,12 @@ collected output around the final JSON):
     kill -9 -- -"$CODEX_PID" 2>/dev/null
     if [ -s "$KIDSFILE" ]; then regrow; sweep9; fi
   }
-  trap cleanup EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  trap cleanup EXIT                               # safety net for an uncontrolled shell exit only
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
   wait "$CODEX_PID"
-  cat "$OUT"
+  cleanup                                         # explicit: the Bash tool's shell persists, so EXIT may not
+  cat "$OUT"                                       # fire at command end — reap the watchdog+group NOW, not at the deadline
 
 Return EXACTLY the contents of "$OUT" — no prose, no markdown fences. If "$OUT"
 is empty or codex errored, return the literal: {"_codex_error": true}
