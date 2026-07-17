@@ -68,12 +68,20 @@ object.
 //             launched as a BACKGROUND Bash call — the Bash tool's foreground cap is
 //             10 min (default 2), and a timeout kill fabricates {"_codex_error":true}.
 //             The in-snippet watchdog TERMs codex and its descendant tree at the
-//             deadline and KILLs survivors 10 s later. Descendants are captured
-//             TRANSITIVELY (kids(): BFS over repeated pgrep -P, depth-capped) to a
-//             temp file BEFORE the TERM — codex runs tools through an intermediate
-//             `bash -lc`, so the real workload sits at depth 2+: when that bash dies
-//             on TERM its children reparent and any single-level pkill -P would never
-//             reach them. The parent's death also unblocks the wrapper's wait, whose
+//             deadline and KILLs survivors 10 s later. Teardown is layered. Layer 1:
+//             codex is launched under bash job control (set -m), giving it its own
+//             process group — group kills (kill -- -PGID) reach every descendant
+//             atomically, INCLUDING reparented orphans (pgid survives reparenting)
+//             and workers codex backgrounds before exiting NORMALLY: the trap ends
+//             with an unconditional group -9 (a no-op when the group is empty, so
+//             the normal path stays delay-free; the pgid cannot be recycled while
+//             any member lives). Layer 2, for pgid escapees (a tool calling setsid):
+//             descendants are also captured TRANSITIVELY (kids(): BFS over repeated
+//             pgrep -P, depth-capped) to a temp file BEFORE the TERM — codex runs
+//             tools through an intermediate `bash -lc`, so the real workload sits at
+//             depth 2+: when that bash dies on TERM its children reparent and any
+//             single-level pkill -P would never reach them. The parent's death also
+//             unblocks the wrapper's wait, whose
 //             EXIT trap reaps the watchdog mid-grace — so the trap ends by sweeping
 //             the captured list itself. Before each final sweep, regrow() re-expands
 //             the capture from still-alive captured PIDs — not just the (possibly
@@ -93,8 +101,9 @@ object.
 //             best-effort, the wrapper is being torn down), and the interrupted wait
 //             no longer falls through to the final cat, which would disguise a
 //             cancelled node as a normal empty result. The kill -0 guard keeps the
-//             normal exit path delay-free. (POSIX sleep/kill/pgrep/ps because macOS
-//             ships neither GNU `timeout` nor `setsid`.)
+//             normal exit path delay-free. (POSIX sleep/kill/pgrep/ps plus bash job
+//             control, because macOS ships neither GNU `timeout` nor `setsid` — set -m
+//             provides the killable group without either.)
 function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label, timeoutMs } = {}) {
   const flags = [
     model  ? `-m ${model}` : '',
@@ -147,9 +156,11 @@ CODEX_SCHEMA_EOF
   cat > "$TASK" <<'CODEX_TASK_EOF'
 ${taskText}
 CODEX_TASK_EOF
+  set -m
   codex exec --skip-git-repo-check -s ${sandbox} ${flags} \\
     --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1 &
   CODEX_PID=$!
+  set +m
   kids() {
     F="$1"; D=0
     while [ -n "$F" ] && [ "$D" -lt 32 ]; do
@@ -173,20 +184,21 @@ CODEX_TASK_EOF
   }
   ( sleep ${deadlineSec}
     kids "$CODEX_PID" > "$KIDSFILE"
-    kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
+    kill -- -"$CODEX_PID" 2>/dev/null; kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
     sleep 10
     kids "$CODEX_PID" >> "$KIDSFILE"
     regrow
-    kill -9 "$CODEX_PID" 2>/dev/null; sweep9 ) >/dev/null 2>&1 &
+    kill -9 -- -"$CODEX_PID" 2>/dev/null; kill -9 "$CODEX_PID" 2>/dev/null; sweep9 ) >/dev/null 2>&1 &
   WATCHDOG_PID=$!
   cleanup() {
     if kill -0 "$CODEX_PID" 2>/dev/null; then
       kids "$CODEX_PID" > "$KIDSFILE"
-      kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
+      kill -- -"$CODEX_PID" 2>/dev/null; kill "$CODEX_PID" $(cat "$KIDSFILE") 2>/dev/null
       sleep 2
       kill -9 "$CODEX_PID" 2>/dev/null
     fi
     kill "$WATCHDOG_PID" $(pgrep -P "$WATCHDOG_PID") 2>/dev/null
+    kill -9 -- -"$CODEX_PID" 2>/dev/null
     if [ -s "$KIDSFILE" ]; then regrow; sweep9; fi
   }
   trap cleanup EXIT
