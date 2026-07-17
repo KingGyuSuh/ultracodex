@@ -47,8 +47,9 @@ object.
 //             are rebased onto the embedded location ("#/properties/result/anyOf/0…"):
 //             wrapping moves the document root, so unrebased they'd resolve against
 //             the envelope — broken refs for $defs, and for recursive self-refs a
-//             validator that rejects every valid payload. Only JSON-pointer fragments
-//             ("#", "#/…") are rebased; named-anchor refs ("#name", paired with
+//             validator that rejects every valid payload. Only whole-resource /
+//             JSON-pointer refs ("", "#", "#/…" — "" and "#" both name the resource
+//             root) are rebased; named-anchor refs ("#name", paired with
 //             $anchor) are left intact — anchors resolve by name within the schema
 //             resource, so they survive relocation and rewriting would corrupt them.
 //             And only in SCHEMA positions: values under const/enum/default/examples
@@ -142,8 +143,8 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
     return Object.fromEntries(Object.entries(node).map(([k, v]) => {
       if (isMap) return [k, rebaseRefs(v)]                     // map keys are property NAMES; values are schemas
       if (DATA_KEYS.includes(k)) return [k, v]                 // a "$ref" inside const/enum is data, not a reference
-      if (k === '$ref' && typeof v === 'string' && (v === '#' || v.startsWith('#/')))
-        return [k, `#/properties/result/anyOf/0${v.slice(1)}`]
+      if (k === '$ref' && typeof v === 'string' && (v === '' || v === '#' || v.startsWith('#/')))
+        return [k, `#/properties/result/anyOf/0${v.slice(1)}`]   // "" and "#" both name the resource root; slice(1) is "" for each
       return [k, rebaseRefs(v, MAP_KEYS.includes(k))]
     }))
   }
