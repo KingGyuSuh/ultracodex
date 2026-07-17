@@ -122,7 +122,11 @@ object.
 //             disguise a cancelled node as a normal empty result. The kill -0 guard
 //             keeps the normal exit path delay-free. (POSIX sleep/kill/pgrep/ps plus bash job
 //             control, because macOS ships neither GNU `timeout` nor `setsid` — set -m
-//             provides the killable group without either.)
+//             provides the killable group without either.) The whole snippet runs
+//             under `bash <<'…'`: the Bash tool executes in the user's LOGIN shell —
+//             zsh on macOS — which rejects `set -m` (can't change option: -m) and
+//             word-splits differently, so without the bash wrapper the teardown
+//             breaks and codex can be killed before it even starts.
 function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort, revalidate = true, phase, label, timeoutMs } = {}) {
   const flags = [
     model  ? `-m ${model}` : '',
@@ -140,6 +144,7 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
   const uniqEof = (base, text) => { let d = base; const ls = text.split('\n'); while (ls.includes(d)) d += '_' + ls.length; return d }
   const SCHEMA_EOF = uniqEof('CODEX_SCHEMA_EOF', schemaJson)
   const TASK_EOF = uniqEof('CODEX_TASK_EOF', taskText)
+  const RUN_EOF = uniqEof('CODEX_RUN_EOF', schemaJson + '\n' + taskText)
   const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : (effort === 'ultra' ? 1800000 : 1200000)
   const deadlineSec = Math.ceil(deadlineMs / 1000)
   const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean', enum: [true] } } }
@@ -172,16 +177,29 @@ Codex runs for many minutes at higher reasoning efforts (real-task runs measured
 ~8–17 min — past the 10-minute foreground Bash cap, let alone the 2-minute
 default, and a timeout kill fabricates a fake error). So launch the snippet
 below as ONE Bash call with run_in_background: true — NEVER as a foreground
-call — then wait for the background task to exit (you are re-invoked when it
-does). The watchdog inside the snippet kills codex after ${deadlineSec}s if it
-runs away (TERM, then KILL 10 s later). The snippet prints nothing except the
-final cat, so the task's collected output IS the JSON — retrieve it and return it.
+call — then WAIT for that background task to actually EXIT before you read its
+output. This is the step that most often goes wrong: the output file stays
+EMPTY for the whole run and only fills at the very end, so do NOT check once,
+see empty, and give up — that returns a false {"_codex_error": true} while
+codex is still working. Keep waiting (you are re-invoked when the task exits;
+if you must poll, sleep in a loop and re-check the task's status, never the file
+alone) until the background task's status is genuinely 'completed'. Only then
+read its collected output. Return {"_codex_error": true} solely when the task
+has EXITED and its output is still empty. The watchdog inside the snippet kills
+codex after ${deadlineSec}s if it runs away (TERM, then KILL 10 s later), so the
+wait is bounded — you will never block forever. The snippet prints nothing except
+the final cat, so the task's collected output IS the JSON — retrieve it and return it.
 
-The snippet (schema and task go into single-quoted heredocs whose delimiters are
-computed to never appear in the content, so untrusted task text can neither expand
-nor close the heredoc early to run in the relay's shell; the exec makes "prints
-nothing" literal — bash job-death notices like "Terminated: 15" would otherwise
-leak into the collected output around the final JSON):
+The snippet runs the whole thing under bash via a heredoc, because the Bash tool
+executes commands in the user's LOGIN shell — zsh on macOS — where "set -m" is
+rejected (can't change option: -m) and unquoted word-splitting differs, which
+silently breaks the process-group teardown and can kill codex before it starts.
+The outer 'bash <<' delimiter is likewise computed to never appear in the body.
+(schema and task go into inner single-quoted heredocs whose delimiters are also
+collision-proof, so untrusted task text can neither expand nor close a heredoc
+early; the exec makes "prints nothing" literal — bash job-death notices like
+"Terminated: 15" would otherwise leak into the collected output around the JSON):
+  bash <<'${RUN_EOF}'
   SCHEMA=$(mktemp); TASK=$(mktemp); OUT=$(mktemp); KIDSFILE=$(mktemp)
   exec 2>/dev/null
   cat > "$SCHEMA" <<'${SCHEMA_EOF}'
@@ -243,6 +261,7 @@ ${TASK_EOF}
   wait "$CODEX_PID"
   cleanup                                         # explicit: the Bash tool's shell persists, so EXIT may not
   cat "$OUT"                                       # fire at command end — reap the watchdog+group NOW, not at the deadline
+${RUN_EOF}
 
 Return EXACTLY the contents of "$OUT" — no prose, no markdown fences. If "$OUT"
 is empty or codex errored, return the literal: {"_codex_error": true}
