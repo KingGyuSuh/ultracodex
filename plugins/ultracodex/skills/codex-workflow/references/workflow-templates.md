@@ -55,6 +55,9 @@ object.
 //             are data (a "$ref" there is a literal, not a reference), and property
 //             maps (properties/$defs/…) are walked as name→schema maps so a property
 //             literally named "$ref" or "const" is not misread as a keyword.
+//             $recursiveRef/$dynamicRef are deliberately left untouched: OpenAI's
+//             structured-outputs schema subset rejects them, so codex --output-schema
+//             fails such a schema upfront and it never reaches re-validation.
 //             Codex itself still gets the ORIGINAL schema file (there the schema IS
 //             the root). Rebasing stops at any subschema carrying a string $id —
 //             root or nested (e.g. under $defs): it forms its own schema resource,
@@ -75,7 +78,10 @@ object.
 //             and workers codex backgrounds before exiting NORMALLY: the trap ends
 //             with an unconditional group -9 (a no-op when the group is empty, so
 //             the normal path stays delay-free; the pgid cannot be recycled while
-//             any member lives). Layer 2, for pgid escapees (a tool calling setsid):
+//             any member lives). On the deadline path, group survivors get whatever
+//             grace codex's own death took — tearing down a timed-out node
+//             prioritizes not leaking over graceful shutdown. Layer 2, for pgid
+//             escapees (a tool calling setsid):
 //             descendants are also captured TRANSITIVELY (kids(): BFS over repeated
 //             pgrep -P, depth-capped) to a temp file BEFORE the TERM — codex runs
 //             tools through an intermediate `bash -lc`, so the real workload sits at
@@ -90,10 +96,16 @@ object.
 //             always race a POSIX sweep). Every DELAYED -9 goes through sweep9(), which
 //             re-checks each captured PID's parentage first (reparented orphan —
 //             ppid 1 — or still inside the captured tree): a PID recycled during the
-//             grace window is not blindly SIGKILLed. Residual caveat: under a
-//             child-subreaper, orphans reparent to the subreaper rather than PID 1
-//             and can escape the sweep — a bounded leak, preferred over -9'ing a
-//             recycled PID. The watchdog is reaped together with its blocked sleep
+//             grace window is not blindly SIGKILLed. Residual caveats, both bounded
+//             and deliberate: (a) under a child-subreaper, orphans reparent to the
+//             subreaper rather than PID 1 and can escape the sweep — preferred over
+//             -9'ing a recycled PID; (b) a descendant that BOTH escapes the pgid (its
+//             own setsid) AND outlives a NORMAL codex exit is not hunted — Layer 2's
+//             capture only runs while codex is alive or on the deadline path, and such
+//             a process is an intentional detached daemon indistinguishable from one a
+//             tool meant to leave running (a read-only verify node should not be
+//             spawning these anyway). Timed-out runs still attempt it. The watchdog is
+//             reaped together with its blocked sleep
 //             child (pre-captured in the same kill) — TERMing the subshell alone
 //             would orphan a deadline-length sleep per successful node. Cancellation
 //             (INT/TERM) exits 130/143 through the EXIT trap: cleanup runs exactly
@@ -111,6 +123,12 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
     effort ? `-c model_reasoning_effort="${effort}"` : '',
   ].filter(Boolean).join(' ')
   const schemaJson = JSON.stringify(schema, null, 2)
+  // base64-embed schema+task: base64's alphabet has no shell metacharacters and no
+  // line that could close a heredoc, so untrusted task text (e.g. reviewed repo
+  // content flowing through a finding into taskText) cannot break out of the heredoc
+  // and execute in the relay's shell — outside codex's read-only sandbox.
+  const schemaB64 = Buffer.from(schemaJson, 'utf8').toString('base64')
+  const taskB64 = Buffer.from(taskText, 'utf8').toString('base64')
   const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : (effort === 'ultra' ? 1800000 : 1200000)
   const deadlineSec = Math.ceil(deadlineMs / 1000)
   const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean', enum: [true] } } }
@@ -148,14 +166,15 @@ does). The watchdog inside the snippet kills codex after ${deadlineSec}s if it
 runs away (TERM, then KILL 10 s later). The snippet prints nothing except the
 final cat, so the task's collected output IS the JSON — retrieve it and return it.
 
-The snippet (the heredocs write the schema and task to temp files):
+The snippet (schema and task are base64-embedded and decoded to temp files —
+base64 is delimiter- and metacharacter-proof, so untrusted task text can't break
+out of a heredoc into the relay's shell; the exec makes "prints nothing" literal —
+bash job-death notices like "Terminated: 15" would otherwise leak into the
+collected output around the final JSON):
   SCHEMA=$(mktemp); TASK=$(mktemp); OUT=$(mktemp); KIDSFILE=$(mktemp)
-  cat > "$SCHEMA" <<'CODEX_SCHEMA_EOF'
-${schemaJson}
-CODEX_SCHEMA_EOF
-  cat > "$TASK" <<'CODEX_TASK_EOF'
-${taskText}
-CODEX_TASK_EOF
+  exec 2>/dev/null
+  printf %s '${schemaB64}' | base64 -d > "$SCHEMA"
+  printf %s '${taskB64}' | base64 -d > "$TASK"
   set -m
   codex exec --skip-git-repo-check -s ${sandbox} ${flags} \\
     --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1 &
@@ -315,22 +334,32 @@ phase('Judge')
 const judged = await parallel(candidates.map((c, i) => () => parallel([
   () => agent(`Score this approach 0..10 for the problem.\n${JSON.stringify(c)}`, { label: `judge:claude:${i}`, schema: SCORE }),
   () => codexNode(`Score this approach 0..10 for the problem.\n${JSON.stringify(c)}`, { schema: SCORE, label: `judge:codex:${i}` }),
-]).then(scores => {
-  // exclude errored jurors from the average — never score an infra failure as 0.
-  // an ALL-errored jury is an infra failure too: avg null, excluded from ranking below,
-  // instead of an avg of 0 that silently sorts the candidate last.
-  const valid = scores.filter(s => s && !s._codex_error)
-  const avg = valid.length ? valid.reduce((a, s) => a + (s.score ?? 0), 0) / valid.length : null
-  return { candidate: c, avg, scores: valid }
+]).then(([claudeScore, codexScore]) => {
+  // tag each juror with its model family and drop errored ones (never score an infra
+  // failure as 0). The panel's whole point is that no candidate is judged only by its
+  // OWN family: if the cross-family juror errored and only the author's family survived,
+  // that is not a valid verdict — avg null (excluded from ranking), same as all-errored.
+  const authorFamily = c.author.split(':')[0]
+  const valid = [
+    claudeScore && !claudeScore._codex_error ? { ...claudeScore, family: 'claude' } : null,
+    codexScore  && !codexScore._codex_error  ? { ...codexScore,  family: 'codex'  } : null,
+  ].filter(Boolean)
+  const jury = valid.some(s => s.family !== authorFamily) ? valid : []
+  const avg = jury.length ? jury.reduce((a, s) => a + (s.score ?? 0), 0) / jury.length : null
+  return { candidate: c, avg, scores: jury }
 })))
 
 const ranked = judged.filter(Boolean).filter(j => j.avg !== null).sort((a, b) => b.avg - a.avg)
 const winner = ranked[0]
-if (!winner) { log('every jury errored — nothing rankable'); return { final: null, winner: null, ranking: [] } }
+if (!winner) { log('no candidate got a valid cross-family verdict — nothing rankable'); return { final: null, winner: null, ranking: [] } }
 
 phase('Synthesize')
 const final = await agent(
-  `Write the final approach. Base it on the winner, grafting the best ideas from the runners-up.\nWINNER: ${JSON.stringify(winner.candidate)}\nALL: ${JSON.stringify(ranked.map(j => ({author: j.candidate.author, avg: j.avg})))}`,
+  // pass the runners-up's FULL content, not just author+avg — "graft the best ideas"
+  // is impossible if the synthesizer can only see who ranked where, not what they proposed.
+  `Write the final approach. Base it on the winner, grafting the best ideas from the runners-up.\n` +
+  `WINNER: ${JSON.stringify(winner.candidate)}\n` +
+  `RUNNERS_UP: ${JSON.stringify(ranked.slice(1).map(j => j.candidate))}`,
 )
 return { final, winner: winner.candidate.author, ranking: ranked.map(j => ({ author: j.candidate.author, avg: j.avg })) }
 ```

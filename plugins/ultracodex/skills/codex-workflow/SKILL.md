@@ -137,7 +137,8 @@ of the helper):
    and `cat "$OUT"`.
 3. **Pass the prompt via stdin (`- < "$TASK"`), not as a shell argument.** Task
    text contains quotes, `$`, and backticks that would break or expand inside a
-   double-quoted arg. The heredoc + stdin path is quoting-proof.
+   double-quoted arg. The helper base64-decodes the task to a temp file and pipes
+   that via stdin — quoting- and injection-proof even for untrusted task text.
 
 `revalidate: true` (the default) re-validates Codex's JSON and returns a parsed
 object — best for small structured payloads (verdicts, scores), immune to schema
