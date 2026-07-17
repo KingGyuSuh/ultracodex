@@ -130,12 +130,16 @@ function codexNode(taskText, { schema, sandbox = 'read-only', model, cwd, effort
     effort ? `-c model_reasoning_effort="${effort}"` : '',
   ].filter(Boolean).join(' ')
   const schemaJson = JSON.stringify(schema, null, 2)
-  // base64-embed schema+task: base64's alphabet has no shell metacharacters and no
-  // line that could close a heredoc, so untrusted task text (e.g. reviewed repo
-  // content flowing through a finding into taskText) cannot break out of the heredoc
-  // and execute in the relay's shell — outside codex's read-only sandbox.
-  const schemaB64 = Buffer.from(schemaJson, 'utf8').toString('base64')
-  const taskB64 = Buffer.from(taskText, 'utf8').toString('base64')
+  // Embed schema+task via single-quoted heredocs whose delimiters are computed to be
+  // ABSENT from the content (extended until no standalone line matches). A quoted
+  // heredoc does no expansion, and a delimiter that cannot appear cannot be used to
+  // close the heredoc early — so untrusted task text (e.g. reviewed repo content
+  // flowing through a finding into taskText) can neither expand nor break out to run
+  // in the relay's shell, outside codex's read-only sandbox. (Base64 would also work
+  // but the workflow runtime exposes no Buffer/btoa/TextEncoder to encode with.)
+  const uniqEof = (base, text) => { let d = base; const ls = text.split('\n'); while (ls.includes(d)) d += '_' + ls.length; return d }
+  const SCHEMA_EOF = uniqEof('CODEX_SCHEMA_EOF', schemaJson)
+  const TASK_EOF = uniqEof('CODEX_TASK_EOF', taskText)
   const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : (effort === 'ultra' ? 1800000 : 1200000)
   const deadlineSec = Math.ceil(deadlineMs / 1000)
   const sentinel = { type: 'object', additionalProperties: false, required: ['_codex_error'], properties: { _codex_error: { type: 'boolean', enum: [true] } } }
@@ -173,15 +177,19 @@ does). The watchdog inside the snippet kills codex after ${deadlineSec}s if it
 runs away (TERM, then KILL 10 s later). The snippet prints nothing except the
 final cat, so the task's collected output IS the JSON — retrieve it and return it.
 
-The snippet (schema and task are base64-embedded and decoded to temp files —
-base64 is delimiter- and metacharacter-proof, so untrusted task text can't break
-out of a heredoc into the relay's shell; the exec makes "prints nothing" literal —
-bash job-death notices like "Terminated: 15" would otherwise leak into the
-collected output around the final JSON):
+The snippet (schema and task go into single-quoted heredocs whose delimiters are
+computed to never appear in the content, so untrusted task text can neither expand
+nor close the heredoc early to run in the relay's shell; the exec makes "prints
+nothing" literal — bash job-death notices like "Terminated: 15" would otherwise
+leak into the collected output around the final JSON):
   SCHEMA=$(mktemp); TASK=$(mktemp); OUT=$(mktemp); KIDSFILE=$(mktemp)
   exec 2>/dev/null
-  printf %s '${schemaB64}' | base64 -d > "$SCHEMA"
-  printf %s '${taskB64}' | base64 -d > "$TASK"
+  cat > "$SCHEMA" <<'${SCHEMA_EOF}'
+${schemaJson}
+${SCHEMA_EOF}
+  cat > "$TASK" <<'${TASK_EOF}'
+${taskText}
+${TASK_EOF}
   set -m
   codex exec --skip-git-repo-check -s ${sandbox} ${flags} \\
     --output-schema "$SCHEMA" -o "$OUT" - < "$TASK" >/dev/null 2>&1 &
